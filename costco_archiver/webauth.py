@@ -12,8 +12,16 @@ real crypto (CBOR/COSE, ES256) that isn't reasonable to hand-roll. Each account
 already carries an empty ``passkeys`` list so credentials can be added later
 without a data migration.
 
-Accounts are managed from the CLI (``python -m costco_archiver auth …``); the web
-UI only *consumes* the store to log people in.
+Each account carries a ``role`` — ``admin`` or ``operator``:
+  - ``operator``  can view/search receipts only.
+  - ``admin``     can do everything an operator can, plus run data jobs
+                  (collect/import/reprocess) and manage user accounts.
+Accounts predating roles (no ``role`` field) are treated as ``admin`` so existing
+single-user installs keep full access. The very first account created is always an
+admin, so the store never ends up with nobody who can manage it.
+
+Accounts are managed from the CLI (``python -m costco_archiver auth …``) and, for
+admins, from the web UI's Users panel; both go through the helpers below.
 """
 from __future__ import annotations
 
@@ -35,6 +43,10 @@ _PBKDF2_ITERATIONS = 200_000
 _TOTP_DIGITS = 6
 _TOTP_PERIOD = 30
 _LOCK = threading.Lock()
+
+# Access roles. 'admin' is a superset of 'operator'.
+VALID_ROLES = ("admin", "operator")
+DEFAULT_ROLE = "operator"
 
 
 # --- password hashing ---------------------------------------------------------
@@ -130,24 +142,86 @@ def get_user(username: str) -> dict | None:
     return _load().get("users", {}).get(username)
 
 
-def add_user(username: str, password: str) -> str:
-    """Create a user with a fresh TOTP secret. Returns the base32 secret."""
+def _role_of(rec: dict | None) -> str:
+    """Role stored on a user record, defaulting legacy (role-less) users to admin."""
+    role = str((rec or {}).get("role") or "").lower()
+    return role if role in VALID_ROLES else "admin"
+
+
+def get_role(username: str) -> str:
+    """'admin' or 'operator' for a user, or '' if the user doesn't exist."""
+    rec = get_user((username or "").strip())
+    return _role_of(rec) if rec else ""
+
+
+def is_admin(username: str) -> bool:
+    return get_role(username) == "admin"
+
+
+def _admins(data: dict) -> list[str]:
+    return [name for name, rec in data.get("users", {}).items()
+            if _role_of(rec) == "admin"]
+
+
+def _is_last_admin(data: dict, username: str) -> bool:
+    """True if `username` is the only admin left — used to block self-lockout."""
+    return _admins(data) == [username]
+
+
+def users_overview() -> list[dict]:
+    """One dict per user (username, role, created_at, mfa) for management views."""
+    data = _load()
+    out = []
+    for name in sorted(data.get("users", {})):
+        rec = data["users"][name]
+        out.append({"username": name, "role": _role_of(rec),
+                    "created_at": rec.get("created_at"),
+                    "mfa": bool(rec.get("totp_secret"))})
+    return out
+
+
+def add_user(username: str, password: str, role: str = DEFAULT_ROLE) -> str:
+    """Create a user with a fresh TOTP secret. Returns the base32 secret.
+
+    The first account ever created is forced to 'admin' so the store always has a
+    manager."""
     username = username.strip()
     if not username:
         raise ValueError("username must not be empty")
+    role = (role or DEFAULT_ROLE).lower()
+    if role not in VALID_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(VALID_ROLES)}")
     with _LOCK:
         data = _load()
         if username in data["users"]:
             raise ValueError(f"user {username!r} already exists")
+        if not data["users"]:
+            role = "admin"  # bootstrap: never leave the store without an admin
         secret = new_totp_secret()
         data["users"][username] = {
             "password": hash_password(password),
             "totp_secret": secret,
+            "role": role,
             "passkeys": [],  # reserved for future WebAuthn credentials
             "created_at": int(time.time()),
         }
         _save(data)
         return secret
+
+
+def set_role(username: str, role: str) -> None:
+    """Change a user's role. Refuses to demote the last remaining admin."""
+    role = (role or "").lower()
+    if role not in VALID_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(VALID_ROLES)}")
+    with _LOCK:
+        data = _load()
+        if username not in data["users"]:
+            raise ValueError(f"no such user: {username!r}")
+        if role != "admin" and _is_last_admin(data, username):
+            raise ValueError("cannot demote the last admin")
+        data["users"][username]["role"] = role
+        _save(data)
 
 
 def set_password(username: str, password: str) -> None:
@@ -176,6 +250,8 @@ def delete_user(username: str) -> None:
         data = _load()
         if username not in data["users"]:
             raise ValueError(f"no such user: {username!r}")
+        if _is_last_admin(data, username):
+            raise ValueError("cannot delete the last admin")
         del data["users"][username]
         _save(data)
 
@@ -217,6 +293,13 @@ def session_user(token: str | None) -> str | None:
             del _SESSIONS[token]
             return None
         return s.username
+
+
+def session_role(token: str | None) -> str:
+    """Live role for a session's user ('' if none). Looked up fresh each call so a
+    role change takes effect on the user's next request without re-login."""
+    user = session_user(token)
+    return get_role(user) if user else ""
 
 
 def destroy_session(token: str | None) -> None:
