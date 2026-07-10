@@ -279,17 +279,42 @@ def save_receipt(receipt: dict, raw_dir: Path = config.RAW_DIR) -> Path:
     return out
 
 
+def _ingest_json_file(f: Path, raw_dir: Path) -> int:
+    """A .json export (API response, or array/obj of receipts). Extracts every
+    receipt-like object and saves each — this is the bulk path used by the
+    browser-console snippet that downloads your whole receipt history."""
+    import json
+    from .api import find_receipts
+    blob = json.loads(f.read_text())
+    receipts = find_receipts(blob)
+    if not receipts and isinstance(blob, dict) and blob.get("itemArray"):
+        receipts = [blob]
+    saved = 0
+    for rec in receipts:
+        if not rec.get("itemArray"):
+            continue
+        rec.setdefault("source", "json-import")
+        save_receipt(rec, raw_dir)
+        saved += 1
+    print(f"  {f.name} → {saved} receipt(s)")
+    return saved
+
+
 def ingest_paths(paths: list[Path], raw_dir: Path = config.RAW_DIR) -> dict:
-    """Ingest a list of .html/.pdf files (or dirs) into raw receipt JSON."""
+    """Ingest .html/.pdf/.json files (or dirs) into raw receipt JSON."""
     files: list[Path] = []
     for p in paths:
         if p.is_dir():
-            files += sorted(p.glob("*.html")) + sorted(p.glob("*.htm")) + sorted(p.glob("*.pdf"))
+            for ext in ("*.html", "*.htm", "*.pdf", "*.json"):
+                files += sorted(p.glob(ext))
         else:
             files.append(p)
     saved = 0
     for f in files:
         try:
+            if f.suffix.lower() == ".json":
+                saved += _ingest_json_file(f, raw_dir)
+                continue
             if f.suffix.lower() in (".html", ".htm"):
                 rec = receipt_from_html(f.read_text())
             elif f.suffix.lower() == ".pdf":

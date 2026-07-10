@@ -70,6 +70,27 @@ Instead do login **and** fetch in one go (the `all` command does this), or run
 and re-logs in, and captures a fresh token by loading your receipts page right
 before returning. A full backfill only takes ~1 minute, well inside the window.
 
+## ⭐ Easiest bulk path: browser-console export
+
+Pull your **entire** receipt history in one shot, using your own logged-in
+browser (so Kasada never sees automation, and there's no token to copy):
+
+1. Log into **costco.com** in your normal browser and open your receipts page.
+2. DevTools → **Console**, paste the contents of
+   [`browser/costco_fetch_receipts.js`](browser/costco_fetch_receipts.js), press Enter.
+   It fetches every year of receipts and downloads `costco_receipts.json`.
+3. Ingest and process the whole file:
+   ```bash
+   python -m costco_archiver import ~/Downloads/costco_receipts.json
+   python -m costco_archiver parse && python -m costco_archiver pdf && python -m costco_archiver markdown
+   python -m costco_archiver web
+   ```
+
+`import` extracts every receipt from that JSON into `data/raw/`, so the
+post-processing steps then cover **all** of them (not just one). If the snippet
+returns 0 receipts or GraphQL errors, copy the console output — the query/endpoint
+may need a tweak for your account.
+
 ## 📄 API-free path: import saved receipt HTML/PDF
 
 Because Kasada blocks scripted logins, the most dependable way to get data is to
