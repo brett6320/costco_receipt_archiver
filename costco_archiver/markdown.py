@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from . import config
+from .barcode_util import barcode_svg
 from .parse import _load_receipts, _receipt_date, _num
 
 _SEARCH = "https://www.costco.com/CatalogSearch?dept=All&keyword={}"
@@ -47,7 +48,7 @@ def _item_link(item_number: str, description: str) -> str:
     return ""
 
 
-def _receipt_page(r: dict) -> str:
+def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
     date = _receipt_date(r)
     warehouse = r.get("warehouseName") or r.get("warehouseShortName") or ""
     barcode = r.get("transactionBarcode") or ""
@@ -56,6 +57,10 @@ def _receipt_page(r: dict) -> str:
         "",
         f"[← Back to index](../index.md)",
         "",
+    ]
+    if barcode_href:
+        lines += [f'<img src="{barcode_href}" alt="{barcode}" height="56">', ""]
+    lines += [
         f"- **Date:** {r.get('transactionDateTime') or date}",
         f"- **Warehouse:** {warehouse}"
         + (f" (#{r.get('warehouseNumber')})" if r.get("warehouseNumber") else ""),
@@ -103,7 +108,9 @@ def generate_markdown(
     config.ensure_dirs()
     md_dir = output_dir / "markdown"
     pages_dir = md_dir / "receipts"
+    bc_dir = md_dir / "barcodes"
     pages_dir.mkdir(parents=True, exist_ok=True)
+    bc_dir.mkdir(parents=True, exist_ok=True)
 
     receipts = _load_receipts(raw_dir)
     # Descending by date (newest purchases first), then by total.
@@ -141,9 +148,15 @@ def generate_markdown(
     idx.append("")
     (md_dir / "index.md").write_text("\n".join(idx))
 
-    # --- per-receipt pages ---
+    # --- per-receipt pages (+ barcode SVG of the transaction number) ---
     for r in receipts:
-        (pages_dir / f"{_safe(r)}.md").write_text(_receipt_page(r))
+        name = _safe(r)
+        href = None
+        bc = barcode_svg(r.get("transactionBarcode") or "")
+        if bc:
+            (bc_dir / f"{name}.svg").write_text(bc)
+            href = f"../barcodes/{name}.svg"
+        (pages_dir / f"{name}.md").write_text(_receipt_page(r, barcode_href=href))
 
     print(f"  Wrote index.md + {len(receipts)} receipt pages → {md_dir}")
     return {"receipts": len(receipts), "index": str(md_dir / "index.md"),

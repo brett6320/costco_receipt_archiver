@@ -66,6 +66,11 @@ def run(tmp: Path):
     for d in (raw, cap, out):
         d.mkdir(parents=True, exist_ok=True)
 
+    # Isolate from any captured request template on the machine, so we test the
+    # default query path deterministically.
+    from costco_archiver import config
+    config.API_REQUEST_FILE = tmp / "no_request_template.json"
+
     # Patch the API and fetch twice to simulate overlapping/rerun dedup.
     fetch_mod.CostcoAPI = FakeAPI
     creds = Credentials(id_token="x", client_id="y")

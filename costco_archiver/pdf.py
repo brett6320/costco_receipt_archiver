@@ -14,6 +14,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from . import config
+from .barcode_util import barcode_svg
 
 
 def _fmt_money(v) -> str:
@@ -42,6 +43,11 @@ def _receipt_html(r: dict) -> str:
             "</tr>"
         )
     body_rows = "\n".join(rows) or "<tr><td colspan=4>No line items</td></tr>"
+    bc = barcode_svg(barcode) if barcode else None
+    barcode_block = (
+        f"<div class='barcode'>{bc}</div>" if bc
+        else (f"<div class='barcode'>{html.escape(barcode)}</div>" if barcode else "")
+    )
     return f"""<!doctype html><html><head><meta charset='utf-8'><style>
       body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color:#111; }}
       h1 {{ font-size: 18px; margin:0 0 2px; }}
@@ -51,9 +57,11 @@ def _receipt_html(r: dict) -> str:
       td.r, th.r {{ text-align:right; }}
       tfoot td {{ font-weight:bold; border-top:2px solid #333; }}
       .barcode {{ font-family:monospace; font-size:10px; color:#888; margin-top:16px; }}
+      .barcode svg {{ max-width:280px; height:auto; }}
     </style></head><body>
       <h1>Costco Receipt — {html.escape(warehouse)}</h1>
       <div class='meta'>{html.escape(date)} &nbsp;•&nbsp; {html.escape(doc)}</div>
+      {barcode_block}
       <table>
         <thead><tr><th>Item #</th><th>Description</th><th class='r'>Qty</th><th class='r'>Amount</th></tr></thead>
         <tbody>{body_rows}</tbody>

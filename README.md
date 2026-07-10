@@ -114,16 +114,25 @@ receipt container (the `#dataToPrint` / receipt dialog) → Copy → **Copy elem
 then `import --clipboard`. Parsing reconciles line items against the printed
 subtotal/tax/total, so you'll know if anything was missed.
 
-## Search UI
+## Web app: capture, collect, and search in one place
 
 ```bash
 python -m costco_archiver web            # then open http://127.0.0.1:8000
 ```
 
-Free-text search across description / item # / warehouse, plus date-range,
-price-range, item-number and warehouse filters; sortable columns; a **Group by
-item #** mode (times purchased, total spent, last price, first/last date); and a
-link from each row to its rendered PDF. Runs fully locally, no dependencies.
+Two tabs:
+
+- **Collect** — on-screen instructions to grab a DevTools *Copy as cURL* of the
+  receipts request, a box to paste it (**Capture**), then **Start collection**
+  (default **36 months**, newest first) with a live progress bar and streaming
+  log as it fetches, parses, renders PDFs, and builds Markdown.
+- **Search** — free-text search across description / item # / warehouse, plus
+  date-range, price-range, item-number and warehouse filters; sortable columns; a
+  **Group by item #** mode (times purchased, total spent, last price, first/last
+  date); and a link from each row to its rendered PDF.
+
+The same capture logic is available on the CLI as `import-curl`; everything the
+web app does maps to CLI commands, so both are maintained.
 
 ## Usage (automated path, if login works)
 

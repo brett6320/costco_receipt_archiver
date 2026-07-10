@@ -1,8 +1,10 @@
-"""A small, dependency-free local web UI to search parsed receipt data.
+"""A small, dependency-free local web UI: capture credentials, collect receipts,
+and search the results — all in one page.
 
-Serves data/output/line_items.csv with free-text search and structured filters
-(date range, price range, item number, warehouse), sortable columns, and a
-"group by item" summary mode. Links each row to its PDF if one was rendered.
+- Collect tab: paste a DevTools 'Copy as cURL' (the import-curl method) to capture
+  credentials, then run a collection going back N months (default 36).
+- Search tab: free-text + date/price/item/warehouse filters over the results,
+  sortable columns, group-by-item mode, and per-row PDF links.
 
 Run:  python -m costco_archiver web    (opens http://127.0.0.1:8000)
 """
@@ -10,10 +12,90 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import config
+
+# --- collection job state (one at a time) -------------------------------------
+_JOB = {"state": "idle", "message": "", "done": 0, "total": 0,
+        "saved": 0, "error": None, "summary": None, "log": []}
+_JOB_LOCK = threading.Lock()
+
+
+def _log(msg: str):
+    with _JOB_LOCK:
+        _JOB["log"].append(msg)
+        del _JOB["log"][:-200]  # keep last 200 lines
+
+
+def _load_creds():
+    from .auth import Credentials
+    f = config.CRED_CACHE_FILE
+    if not f.exists():
+        return None
+    try:
+        return Credentials(**json.loads(f.read_text()))
+    except Exception:
+        return None
+
+
+def _run_collection(months_back: int, do_pdf: bool):
+    from .fetch import fetch_all_receipts
+    from .parse import parse_all
+    from .auth import token_is_expired
+
+    creds = _load_creds()
+    if creds is None:
+        _set_job(state="error", error="No credentials — capture a cURL first.")
+        return
+    if token_is_expired(creds.id_token):
+        _set_job(state="error",
+                 error="Token expired (they last ~15 min). Re-capture a fresh cURL.")
+        return
+
+    def cb(done, total, saved, label):
+        _set_job(state="running", done=done, total=total, saved=saved,
+                 message=f"Fetching {label} — {saved} receipts so far")
+        _log(f"{label}: {saved} receipts collected")
+
+    try:
+        with _JOB_LOCK:
+            _JOB["log"] = []
+        _set_job(state="running", message="Starting collection…",
+                 done=0, total=months_back, saved=0, error=None, summary=None)
+        _log(f"Collecting receipts back {months_back} months (newest first)…")
+        summary = fetch_all_receipts(creds, months_back=months_back, progress_cb=cb)
+        _log(f"Fetched {summary.get('receipts_saved_this_run', 0)} new; "
+             f"{summary.get('total_receipts_on_disk', 0)} total on disk.")
+        _set_job(state="parsing", message="Building CSVs, index & Markdown…")
+        _log("Parsing → CSVs…")
+        parse_all()
+        from .markdown import generate_markdown
+        _log("Generating Markdown archive…")
+        generate_markdown()
+        if do_pdf:
+            _set_job(state="rendering", message="Rendering PDFs…")
+            _log("Rendering per-receipt PDFs…")
+            from .pdf import render_all_pdfs
+            render_all_pdfs()
+        _Handler.rows = _load_rows()  # refresh search data
+        _log(f"Done. {len(_Handler.rows)} line items ready to search.")
+        _set_job(state="done", message="Done.", summary=summary)
+    except Exception as ex:
+        _log(f"ERROR: {ex}")
+        _set_job(state="error", error=str(ex))
+
+
+def _set_job(**kw):
+    with _JOB_LOCK:
+        _JOB.update(kw)
+
+
+def _job_snapshot():
+    with _JOB_LOCK:
+        return dict(_JOB)
 
 # Columns to free-text search across.
 _TEXT_FIELDS = ["item_number", "description", "warehouse", "receipt_id",
@@ -158,6 +240,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/reload":
             _Handler.rows = _load_rows()
             self._send(200, json.dumps({"reloaded": len(self.rows)}).encode())
+        elif path == "/api/collect/status":
+            self._send(200, json.dumps(_job_snapshot()).encode())
         elif path.startswith("/pdf/"):
             name = path[len("/pdf/"):]
             pdf = config.PDF_DIR / f"{name}.pdf"
@@ -165,6 +249,40 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, pdf.read_bytes(), "application/pdf")
             else:
                 self._send(404, b'{"error":"pdf not found"}')
+        else:
+            self._send(404, b'{"error":"not found"}')
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            return {}
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/capture":
+            from .capture import save_from_curl, CaptureError
+            body = self._read_json()
+            try:
+                result = save_from_curl(body.get("curl", ""))
+                self._send(200, json.dumps(result).encode())
+            except CaptureError as ex:
+                self._send(400, json.dumps({"error": str(ex)}).encode())
+            except Exception as ex:
+                self._send(500, json.dumps({"error": str(ex)}).encode())
+        elif path == "/api/collect":
+            snap = _job_snapshot()
+            if snap["state"] in ("running", "parsing", "rendering"):
+                self._send(409, json.dumps({"error": "A collection is already running."}).encode())
+                return
+            body = self._read_json()
+            months = int(body.get("months_back") or 36)
+            do_pdf = bool(body.get("render_pdf", True))
+            t = threading.Thread(target=_run_collection, args=(months, do_pdf), daemon=True)
+            t.start()
+            self._send(200, json.dumps({"started": True, "months_back": months}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -186,16 +304,33 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
 
 _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Costco Receipt Search</title>
+<title>Costco Receipt Archiver</title>
 <style>
-  :root { --bd:#d8dbe0; --fg:#1c2126; --muted:#6b7280; --accent:#005daa; }
+  :root { --bd:#d8dbe0; --fg:#1c2126; --muted:#6b7280; --accent:#005daa; --ok:#127a2b; --err:#b3261e; }
   * { box-sizing:border-box; }
   body { font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; color:var(--fg); background:#f6f7f9; }
-  header { background:var(--accent); color:#fff; padding:12px 18px; }
+  header { background:var(--accent); color:#fff; padding:12px 18px; display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
   header h1 { margin:0; font-size:18px; }
   header .sub { font-size:12px; opacity:.9; }
+  .tabs { display:flex; gap:6px; margin-left:auto; }
+  .tabs button { background:rgba(255,255,255,.15); color:#fff; border:0; padding:7px 14px; border-radius:6px; cursor:pointer; font-size:13px; }
+  .tabs button.active { background:#fff; color:var(--accent); font-weight:600; }
   .wrap { padding:16px 18px; }
-  .filters { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; background:#fff; border:1px solid var(--bd); border-radius:8px; padding:12px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:14px; }
+  .card h2 { margin:0 0 8px; font-size:15px; }
+  ol.steps { margin:0 0 10px; padding-left:20px; font-size:13px; line-height:1.6; }
+  ol.steps code { background:#eef1f5; padding:1px 5px; border-radius:4px; }
+  textarea { width:100%; height:120px; border:1px solid var(--bd); border-radius:6px; padding:8px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .btn { background:var(--accent); color:#fff; border:0; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:13px; }
+  .btn:disabled { opacity:.5; cursor:default; }
+  .btn.secondary { background:#eef1f5; color:var(--fg); }
+  .inline { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .msg { font-size:13px; margin-top:8px; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
+  .bar { height:10px; background:#e9edf2; border-radius:6px; overflow:hidden; margin:10px 0; }
+  .bar > div { height:100%; background:var(--accent); width:0%; transition:width .3s; }
+  .log { background:#0e1420; color:#cfe3ff; font-family:ui-monospace,Menlo,monospace; font-size:12px; border-radius:6px; padding:10px; height:200px; overflow:auto; white-space:pre-wrap; }
+  .filters { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
   .filters label { font-size:11px; color:var(--muted); display:block; margin-bottom:3px; }
   .filters input, .filters select { width:100%; padding:6px 8px; border:1px solid var(--bd); border-radius:6px; font-size:13px; }
   .row2 { display:flex; align-items:center; gap:14px; margin:12px 2px; font-size:13px; color:var(--muted); flex-wrap:wrap; }
@@ -210,33 +345,134 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .desc { white-space:normal; min-width:220px; }
   a.pdf { color:var(--accent); text-decoration:none; }
   .toggle { display:flex; align-items:center; gap:6px; }
+  .hidden { display:none; }
 </style></head><body>
 <header>
-  <h1>Costco Receipt Search</h1>
+  <h1>Costco Receipt Archiver</h1>
   <div class="sub" id="meta">loading…</div>
+  <div class="tabs">
+    <button id="tab-collect" class="active" onclick="showTab('collect')">Collect</button>
+    <button id="tab-search" onclick="showTab('search')">Search</button>
+  </div>
 </header>
+
 <div class="wrap">
-  <div class="filters">
-    <div style="grid-column:1/-1"><label>Search (any term: description, item #, warehouse…)</label>
-      <input id="q" placeholder="e.g. olive oil  ·  1610256  ·  kirkland" autofocus></div>
-    <div><label>Date from</label><input id="date_from" type="date"></div>
-    <div><label>Date to</label><input id="date_to" type="date"></div>
-    <div><label>Item number</label><input id="item_number" placeholder="exact/partial"></div>
-    <div><label>Warehouse</label><input id="warehouse" placeholder="contains…"></div>
-    <div><label>Min price</label><input id="min_price" type="number" step="0.01"></div>
-    <div><label>Max price</label><input id="max_price" type="number" step="0.01"></div>
+  <!-- ============ COLLECT ============ -->
+  <div id="view-collect">
+    <div class="card">
+      <h2>1 · Capture credentials (import-curl)</h2>
+      <ol class="steps">
+        <li>In your <b>normal browser</b>, log in at <code>costco.com</code> and open your <b>Orders &amp; Purchases → Receipts</b> page.</li>
+        <li>Open <b>DevTools</b> (F12 / ⌥⌘I) → <b>Network</b> tab. In the filter box type <code>graphql</code>.</li>
+        <li>Reload the receipts page so a request to <code>ecom-api.costco.com/…/orders/graphql</code> appears.</li>
+        <li><b>Right-click</b> that request → <b>Copy</b> → <b>Copy as cURL</b> (bash on Mac/Linux).</li>
+        <li>Paste it below and click <b>Capture</b>. (The token lasts ~15 min — capture, then collect right away.)</li>
+      </ol>
+      <textarea id="curl" placeholder="curl 'https://ecom-api.costco.com/ebusiness/order/v1/orders/graphql' -H '...' --data-raw '...'"></textarea>
+      <div class="inline" style="margin-top:8px">
+        <button class="btn" id="captureBtn" onclick="capture()">Capture</button>
+        <span class="msg" id="captureMsg"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>2 · Collect receipts</h2>
+      <div class="inline">
+        <label>Go back
+          <input id="months" type="number" min="1" max="120" value="36" style="width:70px;padding:5px;border:1px solid var(--bd);border-radius:6px"> months
+        </label>
+        <label class="toggle"><input type="checkbox" id="renderPdf" checked> Render PDFs</label>
+        <button class="btn" id="collectBtn" onclick="collect()">Start collection</button>
+        <span class="msg" id="collectMsg"></span>
+      </div>
+      <div class="bar"><div id="bar"></div></div>
+      <div class="log" id="log">Idle. Capture credentials above, then start a collection.</div>
+    </div>
   </div>
-  <div class="row2">
-    <span class="stat">Matches: <b id="count">0</b></span>
-    <span class="stat">Total: <b id="total">$0.00</b></span>
-    <label class="toggle"><input type="checkbox" id="group"> Group by item #</label>
-    <span style="flex:1"></span>
-    <button id="reset">Reset</button>
+
+  <!-- ============ SEARCH ============ -->
+  <div id="view-search" class="hidden">
+    <div class="card">
+      <div class="filters">
+        <div style="grid-column:1/-1"><label>Search (any term: description, item #, warehouse…)</label>
+          <input id="q" placeholder="e.g. olive oil  ·  1610256  ·  kirkland"></div>
+        <div><label>Date from</label><input id="date_from" type="date"></div>
+        <div><label>Date to</label><input id="date_to" type="date"></div>
+        <div><label>Item number</label><input id="item_number" placeholder="exact/partial"></div>
+        <div><label>Warehouse</label><input id="warehouse" placeholder="contains…"></div>
+        <div><label>Min price</label><input id="min_price" type="number" step="0.01"></div>
+        <div><label>Max price</label><input id="max_price" type="number" step="0.01"></div>
+      </div>
+      <div class="row2">
+        <span class="stat">Matches: <b id="count">0</b></span>
+        <span class="stat">Total: <b id="total">$0.00</b></span>
+        <label class="toggle"><input type="checkbox" id="group"> Group by item #</label>
+        <span style="flex:1"></span>
+        <button class="btn secondary" id="reset">Reset</button>
+      </div>
+    </div>
+    <div style="overflow:auto; max-height:68vh"><table id="tbl"><thead></thead><tbody></tbody></table></div>
   </div>
-  <div style="overflow:auto; max-height:70vh"><table id="tbl"><thead></thead><tbody></tbody></table></div>
 </div>
+
 <script>
 const $ = id => document.getElementById(id);
+function showTab(name){
+  $("view-collect").classList.toggle("hidden", name!=="collect");
+  $("view-search").classList.toggle("hidden", name!=="search");
+  $("tab-collect").classList.toggle("active", name==="collect");
+  $("tab-search").classList.toggle("active", name==="search");
+  if(name==="search") run();
+}
+
+// ---------- Collect ----------
+async function capture(){
+  const msg = $("captureMsg"); msg.className="msg"; msg.textContent="Capturing…";
+  $("captureBtn").disabled = true;
+  try{
+    const r = await fetch("/api/capture",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({curl: $("curl").value})});
+    const d = await r.json();
+    if(!r.ok){ msg.className="msg err"; msg.textContent = d.error || "Capture failed"; }
+    else {
+      msg.className = d.expired ? "msg err" : "msg ok";
+      msg.textContent = (d.expired ? "⚠ Token already expired — recopy a fresh cURL. " : "✓ Captured. ")
+        + `${d.headers} headers` + (d.has_query?", query captured":"") + `, token ~${d.token_minutes} min left.`;
+    }
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
+  $("captureBtn").disabled = false;
+}
+
+let poll = null;
+async function collect(){
+  const msg = $("collectMsg"); msg.className="msg"; msg.textContent="Starting…";
+  $("collectBtn").disabled = true;
+  const body = { months_back: Number($("months").value)||36, render_pdf: $("renderPdf").checked };
+  const r = await fetch("/api/collect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d = await r.json();
+  if(!r.ok){ msg.className="msg err"; msg.textContent = d.error || "Could not start"; $("collectBtn").disabled=false; return; }
+  msg.textContent = "";
+  if(poll) clearInterval(poll);
+  poll = setInterval(pollStatus, 1000);
+  pollStatus();
+}
+async function pollStatus(){
+  const s = await (await fetch("/api/collect/status")).json();
+  const pct = s.total ? Math.min(100, Math.round(100*s.done/s.total)) : (s.state==="done"?100:0);
+  $("bar").style.width = pct + "%";
+  $("log").textContent = (s.log||[]).join("\n");
+  $("log").scrollTop = $("log").scrollHeight;
+  const done = s.state==="done", err = s.state==="error";
+  if(done || err){
+    clearInterval(poll); poll=null; $("collectBtn").disabled=false;
+    const msg = $("collectMsg");
+    msg.className = err ? "msg err" : "msg ok";
+    msg.textContent = err ? ("Error: "+(s.error||"")) : `Done — ${s.saved} receipts. Open the Search tab.`;
+    if(done){ loadMeta(); }
+  }
+}
+
+// ---------- Search ----------
 const inputs = ["q","date_from","date_to","item_number","warehouse","min_price","max_price"];
 let sort = "date", order = "desc";
 const COLS = {
@@ -283,9 +519,15 @@ const debounce = (fn,ms)=>{ let t; return ()=>{ clearTimeout(t); t=setTimeout(fn
 inputs.forEach(k => $(k).addEventListener("input", debounce(run,250)));
 $("group").addEventListener("change", ()=>{ sort = $("group").checked?"total_spent":"date"; run(); });
 $("reset").onclick = ()=>{ inputs.forEach(k=>$(k).value=""); $("group").checked=false; sort="date"; order="desc"; run(); };
-(async ()=>{
+
+async function loadMeta(){
   const m = await (await fetch("/api/meta")).json();
   $("meta").textContent = `${m.total_line_items.toLocaleString()} line items · ${m.date_min||"?"} → ${m.date_max||"?"} · ${m.warehouses.length} warehouses`;
-  run();
+}
+// If a collection is already running when the page loads, resume showing status.
+(async ()=>{
+  loadMeta();
+  const s = await (await fetch("/api/collect/status")).json();
+  if(["running","parsing","rendering"].includes(s.state)){ poll=setInterval(pollStatus,1000); pollStatus(); }
 })();
 </script></body></html>"""

@@ -50,8 +50,13 @@ def fetch_all_receipts(
     max_empty_windows: int = 6,
     document_type: str = "all",
     raw_dir: Path = config.RAW_DIR,
+    progress_cb=None,
 ) -> dict:
-    """Download all receipts, newest first. Returns a run summary."""
+    """Download all receipts, newest first. Returns a run summary.
+
+    progress_cb(done, total, saved, label) is called after each window so a UI
+    can show live progress.
+    """
     config.ensure_dirs()
     today = dt.date.today()
     window_end = today
@@ -98,6 +103,11 @@ def fetch_all_receipts(
 
             date_label = f"{window_start:%Y-%m}"
             print(f"  {date_label}: {len(receipts)} receipts ({new_here} new)")
+            if progress_cb:
+                try:
+                    progress_cb(windows, months_back, saved, date_label)
+                except Exception:
+                    pass
 
             empty_streak = empty_streak + 1 if not receipts else 0
             if empty_streak >= max_empty_windows:

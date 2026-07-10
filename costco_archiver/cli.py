@@ -141,47 +141,7 @@ def cmd_paste_token(args) -> None:
     print("    python -m costco_archiver fetch && python -m costco_archiver parse")
 
 
-def _parse_curl(text: str) -> tuple[str, dict, str]:
-    """Parse a browser 'Copy as cURL' command into (url, headers, data).
-
-    Handles bash ($'...') and cmd/PowerShell (^ line continuations) variants.
-    """
-    import shlex
-    t = text.strip()
-    # Normalize line continuations and Chrome's ANSI-C quoting.
-    t = t.replace("\\\n", " ").replace("^\n", " ").replace("`\n", " ")
-    t = t.replace(" $'", " '")
-    try:
-        tokens = shlex.split(t)
-    except ValueError:
-        tokens = shlex.split(t.replace("$'", "'"))
-
-    url, headers, data = "", {}, ""
-    data_flags = ("--data", "--data-raw", "--data-binary", "--data-ascii", "-d")
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in ("-H", "--header") and i + 1 < len(tokens):
-            raw = tokens[i + 1]
-            # Skip HTTP/2 pseudo-headers like ':authority: ...'.
-            if ":" in raw and not raw.startswith(":"):
-                k, v = raw.split(":", 1)
-                if k.strip():
-                    headers[k.strip()] = v.strip()
-            i += 2
-            continue
-        if tok in ("-b", "--cookie") and i + 1 < len(tokens):
-            headers["cookie"] = tokens[i + 1]
-            i += 2
-            continue
-        if tok in data_flags and i + 1 < len(tokens):
-            data = tokens[i + 1]
-            i += 2
-            continue
-        if tok.lower().startswith("http"):
-            url = tok
-        i += 1
-    return url, headers, data
+from .capture import parse_curl as _parse_curl, save_from_curl, CaptureError
 
 
 def cmd_import_curl(args) -> None:
@@ -193,7 +153,6 @@ def cmd_import_curl(args) -> None:
     ecom-api.costco.com/.../graphql → Copy → Copy as cURL. Then run this; it reads
     the cURL from your clipboard and captures every header verbatim.
     """
-    config.ensure_dirs()
     text = None
     if getattr(args, "file", None):
         text = Path(args.file).read_text()
@@ -204,54 +163,15 @@ def cmd_import_curl(args) -> None:
         print("  3. Right-click the '.../orders/graphql' request → Copy → Copy as cURL")
         print("  4. Come back here (it reads your clipboard)\n")
         text = _read_clipboard()
-    if not text or "curl" not in text.lower():
-        raise SystemExit("No cURL command found (clipboard empty? use --file <path>).")
+    try:
+        result = save_from_curl(text or "")
+    except CaptureError as ex:
+        raise SystemExit(str(ex))
 
-    url, headers, data = _parse_curl(text)
-    # Drop headers that break an httpx replay (auto-managed / HTTP-2 pseudo).
-    _DROP = {"content-length", "accept-encoding", "host", "connection",
-             "transfer-encoding"}
-    headers = {
-        k: v for k, v in headers.items()
-        if not k.startswith(":") and k.lower() not in _DROP
-    }
-    # Normalize header keys to what the API client / capture expects.
-    hl = {k.lower(): v for k, v in headers.items()}
-    auth = hl.get("costco-x-authorization") or hl.get("authorization")
-    cid = hl.get("costco-x-wcs-clientid")
-    if not auth or not cid:
-        raise SystemExit(
-            "That cURL is missing costco-x-authorization / costco-x-wcs-clientid. "
-            "Make sure you copied the request to ecom-api.costco.com/.../graphql "
-            "(not a different request)."
-        )
-
-    config.API_HEADERS_FILE.write_text(json.dumps(headers, indent=2))
-    token = auth.replace("Bearer ", "").strip()
-    creds = Credentials(id_token=token, client_id=cid)
-    CRED_CACHE.write_text(json.dumps(asdict(creds), indent=2))
-
-    # Save the exact request so fetch can replay Costco's real query verbatim.
-    req_saved = False
-    if data and url:
-        try:
-            body = json.loads(data)
-            config.API_REQUEST_FILE.write_text(
-                json.dumps({"url": url, "body": body}, indent=2))
-            req_saved = True
-        except ValueError:
-            config.API_REQUEST_FILE.write_text(
-                json.dumps({"url": url, "raw_body": data}, indent=2))
-            req_saved = True
-
-    print(f"\n>>> Imported {len(headers)} headers from cURL"
-          + (" + captured the request query." if req_saved else "."))
-    exp = token_expiry(token)
-    if exp:
-        import datetime
-        mins = int((exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) // 60
-        print(f">>> Token valid ~{max(0, mins)} more min.")
-    if token_is_expired(token):
+    print(f"\n>>> Imported {result['headers']} headers from cURL"
+          + (" + captured the request query." if result["has_query"] else "."))
+    print(f">>> Token valid ~{result['token_minutes']} more min.")
+    if result["expired"]:
         print("!!! That token is ALREADY expired — recopy a fresh cURL and retry.")
     else:
         print(">>> Run NOW:  python -m costco_archiver fetch && python -m costco_archiver parse")

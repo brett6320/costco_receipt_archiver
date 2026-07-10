@@ -10,3 +10,6 @@ python-dateutil>=2.9
 
 # Parse printed receipt PDFs in the API-free `import` path (ingest.py).
 pypdf>=4.0
+
+# Render the receipt-number barcode (Interleaved 2 of 5) as SVG — no image deps.
+python-barcode>=0.15

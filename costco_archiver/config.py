@@ -28,6 +28,9 @@ API_HEADERS_FILE = DATA_DIR / "api_headers.json"
 # windows instead of relying on a hard-coded query that may drift.
 API_REQUEST_FILE = DATA_DIR / "api_request.json"
 
+# Decoded token/clientid cache (short-lived; token ~15 min).
+CRED_CACHE_FILE = DATA_DIR / "credentials.json"
+
 # Costco endpoints (undocumented; reverse-engineered from the site's own calls).
 GRAPHQL_URL = "https://ecom-api.costco.com/ebusiness/order/v1/orders/graphql"
 SIGNIN_URL = "https://www.costco.com/LogonForm"
