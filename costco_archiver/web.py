@@ -367,19 +367,19 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   }
   /* ---- Explicit dark ---- */
   :root[data-theme="dark"] {
-    --bg:#14110a; --fg:#ece7d8; --muted:#b0a78c; --card:#1d1810; --bd:#3a3220;
-    --line:#2e2a1e; --accent:#c9a13a; --on-accent:#1a1400; --thead:#221d10;
-    --rowhover:#221b0f; --input-bg:#14110a; --chip:#2a2416; --code:#2a2416;
-    --log-bg:#0c0a05; --log-fg:#f0e6c8; --ok:#7bd88f; --err:#ff8a80;
+    --bg:#0f141a; --fg:#e6e9ee; --muted:#9aa4b2; --card:#161b22; --bd:#2b3440;
+    --line:#232b34; --accent:#3b82f6; --on-accent:#ffffff; --thead:#1b222b;
+    --rowhover:#1a212a; --input-bg:#0f141a; --chip:#222a33; --code:#222a33;
+    --log-bg:#080c12; --log-fg:#cfe3ff; --ok:#4ecb71; --err:#ff6b60;
     color-scheme: dark;
   }
   /* ---- System (default): mirror dark when the OS is dark ---- */
   @media (prefers-color-scheme: dark) {
     :root[data-theme="system"] {
-      --bg:#14110a; --fg:#ece7d8; --muted:#b0a78c; --card:#1d1810; --bd:#3a3220;
-      --line:#2e2a1e; --accent:#c9a13a; --on-accent:#1a1400; --thead:#221d10;
-      --rowhover:#221b0f; --input-bg:#14110a; --chip:#2a2416; --code:#2a2416;
-      --log-bg:#0c0a05; --log-fg:#f0e6c8; --ok:#7bd88f; --err:#ff8a80;
+      --bg:#0f141a; --fg:#e6e9ee; --muted:#9aa4b2; --card:#161b22; --bd:#2b3440;
+      --line:#232b34; --accent:#3b82f6; --on-accent:#ffffff; --thead:#1b222b;
+      --rowhover:#1a212a; --input-bg:#0f141a; --chip:#222a33; --code:#222a33;
+      --log-bg:#080c12; --log-fg:#cfe3ff; --ok:#4ecb71; --err:#ff6b60;
       color-scheme: dark;
     }
   }
