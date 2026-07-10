@@ -68,10 +68,43 @@ Instead do login **and** fetch in one go (the `all` command does this), or run
 and re-logs in, and captures a fresh token by loading your receipts page right
 before returning. A full backfill only takes ~1 minute, well inside the window.
 
-## Usage
+## 📄 API-free path: import saved receipt HTML/PDF
+
+Because Kasada blocks scripted logins, the most dependable way to get data is to
+open a receipt in your **normal** browser and save it, then import it — no API,
+no token, no bot detection. Both formats parse into the same schema as `fetch`:
 
 ```bash
-# Recommended: login + fetch + parse in one shot (no stale-token gap)
+# Save a receipt as PDF (browser Print → Save as PDF) or copy its HTML, then:
+python -m costco_archiver import path/to/receipt.pdf
+python -m costco_archiver import path/to/receipts_folder/      # a whole folder
+python -m costco_archiver import --clipboard                   # HTML on clipboard
+
+python -m costco_archiver parse    # build CSVs
+python -m costco_archiver pdf      # render a clean PDF archive of each receipt
+python -m costco_archiver web      # search UI at http://127.0.0.1:8000
+```
+
+To copy a receipt's HTML: open the receipt, DevTools → Elements, right-click the
+receipt container (the `#dataToPrint` / receipt dialog) → Copy → **Copy element**,
+then `import --clipboard`. Parsing reconciles line items against the printed
+subtotal/tax/total, so you'll know if anything was missed.
+
+## Search UI
+
+```bash
+python -m costco_archiver web            # then open http://127.0.0.1:8000
+```
+
+Free-text search across description / item # / warehouse, plus date-range,
+price-range, item-number and warehouse filters; sortable columns; a **Group by
+item #** mode (times purchased, total spent, last price, first/last date); and a
+link from each row to its rendered PDF. Runs fully locally, no dependencies.
+
+## Usage (automated path, if login works)
+
+```bash
+# Recommended: login + fetch + parse + pdf in one shot (no stale-token gap)
 python -m costco_archiver all --skip-online
 
 # Do everything incl. online-order harvest
@@ -101,6 +134,8 @@ Useful flags:
 
 Raw archives are kept in `data/raw/` (per-receipt JSON) and `data/captured/`
 (online-order network captures) so you can re-parse without re-downloading.
+Rendered per-receipt PDFs (plus any real PDFs the site served) live in
+`data/pdfs/`.
 
 ## Privacy
 

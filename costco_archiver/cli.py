@@ -269,11 +269,48 @@ def cmd_parse(args) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def cmd_import(args) -> None:
+    """Ingest saved receipt HTML/PDF files into raw receipt JSON."""
+    from .ingest import ingest_paths, receipt_from_html, save_receipt
+
+    if getattr(args, "clipboard", False):
+        text = _read_clipboard()
+        if not text or "<" not in text:
+            raise SystemExit("Clipboard has no HTML. Copy a receipt's outerHTML first.")
+        rec = receipt_from_html(text)
+        if not rec.get("itemArray"):
+            raise SystemExit("No line items found in the clipboard HTML.")
+        out = save_receipt(rec)
+        print(f"  clipboard → {out.name}  ({len(rec['itemArray'])} items, "
+              f"total {rec.get('total')})")
+        summary = {"ingested": 1}
+    else:
+        if not args.paths:
+            raise SystemExit("Provide file/dir paths, or --clipboard.")
+        summary = ingest_paths([Path(p) for p in args.paths])
+    print(json.dumps(summary, indent=2))
+
+
+def cmd_pdf(args) -> None:
+    from .pdf import render_all_pdfs
+
+    summary = render_all_pdfs(force=getattr(args, "force", False))
+    print(json.dumps(summary, indent=2))
+
+
+def cmd_web(args) -> None:
+    from .web import serve
+
+    serve(host=args.host, port=args.port)
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
     if not args.skip_online:
         cmd_online(args)
     cmd_parse(args)
+    if not getattr(args, "skip_pdf", False):
+        cmd_pdf(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -323,13 +360,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.set_defaults(func=cmd_parse)
 
-    sp = sub.add_parser("all", help="login -> fetch -> online -> parse")
+    sp = sub.add_parser("import",
+                        help="ingest saved receipt HTML/PDF files (API-free path)")
+    sp.add_argument("paths", nargs="*", help="receipt .html/.pdf files or directories")
+    sp.add_argument("--clipboard", action="store_true",
+                    help="ingest a receipt's HTML copied to the clipboard")
+    sp.set_defaults(func=cmd_import)
+
+    sp = sub.add_parser("pdf", help="render each receipt to a PDF archive (data/pdfs)")
+    sp.add_argument("--force", action="store_true", help="re-render existing PDFs")
+    sp.set_defaults(func=cmd_pdf)
+
+    sp = sub.add_parser("web", help="launch the local receipt search UI")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8000)
+    sp.set_defaults(func=cmd_web)
+
+    sp = sub.add_parser("all", help="login -> fetch -> online -> parse -> pdf")
     add_common(sp)
     sp.add_argument("--months-back", type=int, default=36)
     sp.add_argument("--max-empty", type=int, default=6)
     sp.add_argument("--doc-type", default="all")
     sp.add_argument("--scroll-rounds", type=int, default=8)
     sp.add_argument("--skip-online", action="store_true")
+    sp.add_argument("--skip-pdf", action="store_true")
     sp.set_defaults(func=cmd_all)
 
     return p

@@ -46,6 +46,16 @@ def harvest_online_orders(
         def on_response(resp):
             url = resp.url
             ct = (resp.headers or {}).get("content-type", "")
+            # Save any real PDF the site serves (invoices, order receipts).
+            if "pdf" in ct.lower() or url.lower().split("?")[0].endswith(".pdf"):
+                try:
+                    data = resp.body()
+                    name = re.sub(r"[^A-Za-z0-9]", "_", url.split("?")[0])[-90:]
+                    (config.PDF_DIR / f"online_{name}.pdf").write_bytes(data)
+                    count["saved"] += 1
+                except Exception:
+                    pass
+                return
             if "json" not in ct or not _INTERESTING.search(url):
                 return
             try:

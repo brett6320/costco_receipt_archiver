@@ -7,3 +7,6 @@ httpx[http2]>=0.27
 
 # Monthly-window date math in fetch.py.
 python-dateutil>=2.9
+
+# Parse printed receipt PDFs in the API-free `import` path (ingest.py).
+pypdf>=4.0

@@ -16,6 +16,7 @@ DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"           # raw JSON responses, one file per receipt/order
 CAPTURE_DIR = DATA_DIR / "captured"  # raw network captures (fallback harvest)
 OUTPUT_DIR = DATA_DIR / "output"     # parsed CSV / summaries
+PDF_DIR = DATA_DIR / "pdfs"          # per-receipt PDF archive (+ captured PDFs)
 
 # Exact request headers captured from the browser's own receipts call. Preferred
 # over reconstructed headers because they include everything the API expects.
@@ -42,5 +43,5 @@ USER_AGENT = (
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, RAW_DIR, CAPTURE_DIR, OUTPUT_DIR):
+    for d in (DATA_DIR, RAW_DIR, CAPTURE_DIR, OUTPUT_DIR, PDF_DIR):
         d.mkdir(parents=True, exist_ok=True)
