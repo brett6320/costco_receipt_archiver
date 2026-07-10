@@ -1,5 +1,8 @@
 # Costco Receipt Archiver
 
+[![build-image](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/build-image.yml/badge.svg)](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/build-image.yml)
+[![tests](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/tests.yml/badge.svg)](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/tests.yml)
+
 Logs into Costco.com in a real browser you control, downloads **all available
 warehouse & gas receipts**, and compiles every purchased item into
 **deduplicated CSVs** — by date, price, and item number.
@@ -117,20 +120,36 @@ Accounts are **local**, and login is **password + a TOTP one-time code** (the
 6-digit codes from Google Authenticator, 1Password, Authy, etc.). There's no open
 access — if no account exists, the login page refuses everyone.
 
-Manage accounts from the CLI (secrets are shown in your terminal, not the browser):
+**Roles.** Every account is either an **operator** or an **admin**:
+
+| Capability                                   | operator | admin |
+|----------------------------------------------|:--------:|:-----:|
+| Search / view / export receipts, open PDFs   |    ✅    |  ✅   |
+| Collect & import data, reprocess, refresh     |    —     |  ✅   |
+| Manage users (add / update / delete, roles)  |    —     |  ✅   |
+
+The **first account created is always an admin** (so there's always someone who can
+manage the rest), and the app refuses to demote or delete the **last** admin.
+Operators get a read-only UI — the Collect and Users tabs and the per-receipt refresh
+controls are hidden, and the server enforces this independently of the UI.
+
+Admins can manage accounts from the **Users** tab in the web UI, or from the CLI
+(secrets are shown in your terminal, not the browser):
 
 ```bash
-python -m costco_archiver auth adduser <name>   # prompts for a password, prints the TOTP secret
-python -m costco_archiver auth users            # list accounts
-python -m costco_archiver auth passwd <name>    # change password
-python -m costco_archiver auth reset-mfa <name> # regenerate the TOTP secret
-python -m costco_archiver auth deluser <name>   # remove an account
+python -m costco_archiver auth adduser <name>              # create (first user → admin; else operator)
+python -m costco_archiver auth adduser <name> --role admin # create an admin
+python -m costco_archiver auth setrole <name> operator     # change role (admin|operator)
+python -m costco_archiver auth users                       # list accounts + roles
+python -m costco_archiver auth passwd <name>               # change password
+python -m costco_archiver auth reset-mfa <name>            # regenerate the TOTP secret
+python -m costco_archiver auth deluser <name>              # remove an account
 ```
 
-`adduser` prints an `otpauth://` URI and a base32 secret — scan/paste it into your
-authenticator, then sign in with your password + the current code. Accounts live in
-`data/web_users.json` (git-ignored, `0600`; passwords are salted **PBKDF2-HMAC-SHA256**,
-never stored in plaintext).
+`adduser` (and the Users tab) prints an `otpauth://` URI and a base32 secret — scan/paste
+it into your authenticator, then sign in with your password + the current code. Accounts
+live in `data/web_users.json` (git-ignored, `0600`; passwords are salted
+**PBKDF2-HMAC-SHA256**, never stored in plaintext).
 
 Relevant environment variables:
 
