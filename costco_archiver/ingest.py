@@ -281,23 +281,29 @@ def save_receipt(receipt: dict, raw_dir: Path = config.RAW_DIR) -> Path:
 
 def _ingest_json_file(f: Path, raw_dir: Path) -> int:
     """A .json export (API response, or array/obj of receipts). Extracts every
-    receipt-like object and saves each — this is the bulk path used by the
-    browser-console snippet that downloads your whole receipt history."""
+    receipt-like object AND any online orders (getOnlineOrders/bcOrders) and
+    saves each — the bulk path used by the browser-console snippet."""
     import json
-    from .api import find_receipts
+    from .api import find_receipts, find_online_orders
     blob = json.loads(f.read_text())
     receipts = find_receipts(blob)
     if not receipts and isinstance(blob, dict) and blob.get("itemArray"):
         receipts = [blob]
-    saved = 0
+    online = find_online_orders(blob)  # bcOrders -> normalized receipts
+    saved, online_saved = 0, 0
     for rec in receipts:
         if not rec.get("itemArray"):
             continue
         rec.setdefault("source", "json-import")
         save_receipt(rec, raw_dir)
         saved += 1
-    print(f"  {f.name} → {saved} receipt(s)")
-    return saved
+    for rec in online:
+        # keep online keys distinct from warehouse to avoid collisions
+        out = raw_dir / f"online_{_safe_name(rec)}.json"
+        out.write_text(json.dumps(rec, indent=2))
+        online_saved += 1
+    print(f"  {f.name} → {saved} receipt(s), {online_saved} online order(s)")
+    return saved + online_saved
 
 
 def ingest_paths(paths: list[Path], raw_dir: Path = config.RAW_DIR) -> dict:

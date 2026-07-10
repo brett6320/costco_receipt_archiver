@@ -155,14 +155,39 @@ def generate_markdown(
 
     # --- per-receipt pages (+ barcode SVG of the transaction number) ---
     for r in receipts:
-        name = _safe(r)
-        href = None
-        bc = barcode_svg(r.get("transactionBarcode") or "")
-        if bc:
-            (bc_dir / f"{name}.svg").write_text(bc)
-            href = f"../barcodes/{name}.svg"
-        (pages_dir / f"{name}.md").write_text(_receipt_page(r, barcode_href=href))
+        _write_receipt_page(r, pages_dir, bc_dir)
 
     print(f"  Wrote index.md + {len(receipts)} receipt pages → {md_dir}")
     return {"receipts": len(receipts), "index": str(md_dir / "index.md"),
             "pages_dir": str(pages_dir)}
+
+
+def _write_receipt_page(r: dict, pages_dir: Path, bc_dir: Path) -> str:
+    name = _safe(r)
+    href = None
+    bc = barcode_svg(r.get("transactionBarcode") or "")
+    if bc:
+        (bc_dir / f"{name}.svg").write_text(bc)
+        href = f"../barcodes/{name}.svg"
+    (pages_dir / f"{name}.md").write_text(_receipt_page(r, barcode_href=href))
+    return name
+
+
+def generate_one(receipt_key: str, raw_dir: Path = config.RAW_DIR,
+                 output_dir: Path = config.OUTPUT_DIR) -> bool:
+    """Regenerate a single receipt's Markdown page + barcode from its raw JSON."""
+    import json
+    src = raw_dir / f"{receipt_key}.json"
+    if not src.exists():
+        return False
+    try:
+        r = json.loads(src.read_text())
+    except Exception:
+        return False
+    md_dir = output_dir / "markdown"
+    pages_dir = md_dir / "receipts"
+    bc_dir = md_dir / "barcodes"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    bc_dir.mkdir(parents=True, exist_ok=True)
+    _write_receipt_page(r, pages_dir, bc_dir)
+    return True

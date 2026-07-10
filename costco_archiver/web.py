@@ -30,6 +30,37 @@ def _log(msg: str):
         del _JOB["log"][:-200]  # keep last 200 lines
 
 
+def _raw_key_for(receipt_id: str):
+    """Map a search-row receipt_id (transactionBarcode) to its raw file stem."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", receipt_id)
+    if (config.RAW_DIR / f"{safe}.json").exists():
+        return safe
+    for f in config.RAW_DIR.glob("*.json"):
+        try:
+            r = json.loads(f.read_text())
+        except Exception:
+            continue
+        if str(r.get("transactionBarcode") or "") == receipt_id:
+            return f.stem
+    return None
+
+
+def _refresh_one(receipt_id: str, do_pdf: bool) -> dict:
+    """Regenerate one receipt's Markdown page, barcode, and (optionally) PDF."""
+    key = _raw_key_for(receipt_id)
+    if not key:
+        return {"ok": False, "error": f"receipt {receipt_id} not found on disk"}
+    from .markdown import generate_one
+    md_ok = generate_one(key)
+    pdf_ok = False
+    if do_pdf:
+        from .pdf import render_one_pdf
+        pdf_ok = render_one_pdf(key)
+    return {"ok": True, "receipt_id": receipt_id, "key": key,
+            "markdown": md_ok, "pdf": pdf_ok}
+
+
 def _load_creds():
     from .auth import Credentials
     f = config.CRED_CACHE_FILE
@@ -337,6 +368,17 @@ class _Handler(BaseHTTPRequestHandler):
             t = threading.Thread(target=_run_reprocess, args=(do_pdf,), daemon=True)
             t.start()
             self._send(200, json.dumps({"started": True}).encode())
+        elif path == "/api/refresh_one":
+            body = self._read_json()
+            rid = str(body.get("receipt_id", "")).strip()
+            if not rid:
+                self._send(400, json.dumps({"error": "receipt_id required"}).encode())
+                return
+            try:
+                result = _refresh_one(rid, bool(body.get("render_pdf", True)))
+                self._send(200 if result.get("ok") else 404, json.dumps(result).encode())
+            except Exception as ex:
+                self._send(500, json.dumps({"error": str(ex)}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -432,6 +474,8 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .tbadge { display:inline-block; width:20px; height:20px; line-height:20px; text-align:center;
     border-radius:5px; font-weight:700; font-size:11px; color:#fff; background:var(--tc,#666); }
   a.pdf { color:var(--accent); text-decoration:none; }
+  .rfr { cursor:pointer; color:var(--muted); user-select:none; font-size:13px; }
+  .rfr:hover { color:var(--accent); }
   .toggle { display:flex; align-items:center; gap:6px; }
   .hidden { display:none; }
   /* Same-order visual delineator */
@@ -615,6 +659,17 @@ async function pollStatus(){
     if(done){ loadMeta(); if(!$("view-search").classList.contains("hidden")) run(); }
   }
 }
+async function refreshOne(receiptId, el){
+  const prev = el.textContent; el.textContent = "⏳"; el.style.pointerEvents="none";
+  try{
+    const r = await fetch("/api/refresh_one",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({receipt_id: receiptId, render_pdf: true})});
+    const d = await r.json();
+    el.textContent = (r.ok && d.ok) ? "✓" : "✗";
+    el.title = (r.ok && d.ok) ? "Refreshed PDF, barcode & Markdown" : (d.error || "Failed");
+  }catch(e){ el.textContent = "✗"; el.title = String(e); }
+  setTimeout(()=>{ el.textContent = prev; el.style.pointerEvents=""; }, 2500);
+}
 async function reprocess(){
   const rb=$("reprocessBtn"); if(rb) rb.disabled=true;
   const m=$("reprocessMsg"); if(m){ m.className="msg"; m.textContent="Refreshing…"; }
@@ -698,7 +753,7 @@ async function run(){
       else if(k==="order_type") v = typeBadge(r.order_type);
       // Exclude product metadata (lookup link) for gas/fuel purchases.
       else if(k==="item_number" && v) v = (r.order_type==="fuel") ? String(v) : itemLink(v);
-      else if(k==="receipt_id" && v) v = `<a class="pdf" href="/pdf/${encodeURIComponent(v)}" target="_blank" rel="noopener">${v.slice(0,10)}…</a>`;
+      else if(k==="receipt_id" && v) v = `<a class="pdf" href="/pdf/${encodeURIComponent(v)}" target="_blank" rel="noopener">${v.slice(0,10)}…</a> <span class="rfr" title="Refresh this receipt's PDF, barcode & Markdown" onclick="refreshOne('${v}', this)">↻</span>`;
       else v = (v==null?"":String(v));
       return `<td class="${num?'num':''} ${k==='description'?'desc':''}">${v}</td>`;
     }).join("");

@@ -257,6 +257,30 @@ def cmd_markdown(args) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def cmd_refresh(args) -> None:
+    """Refresh metadata (PDF, barcode, Markdown) for a single receipt."""
+    from .markdown import generate_one
+    from .pdf import render_one_pdf
+    import re
+
+    rid = args.receipt_id
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", rid)
+    key = safe if (config.RAW_DIR / f"{safe}.json").exists() else None
+    if key is None:  # fall back to matching by transactionBarcode
+        for f in config.RAW_DIR.glob("*.json"):
+            try:
+                if str(json.loads(f.read_text()).get("transactionBarcode") or "") == rid:
+                    key = f.stem
+                    break
+            except Exception:
+                continue
+    if key is None:
+        raise SystemExit(f"Receipt {rid} not found in {config.RAW_DIR}")
+    md = generate_one(key)
+    pdf = render_one_pdf(key) if not args.no_pdf else False
+    print(json.dumps({"receipt": rid, "key": key, "markdown": md, "pdf": pdf}, indent=2))
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
     if not args.skip_online:
@@ -335,6 +359,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("markdown",
                         help="generate a Markdown archive (index + per-receipt pages)")
     sp.set_defaults(func=cmd_markdown)
+
+    sp = sub.add_parser("refresh",
+                        help="refresh metadata (PDF, barcode, Markdown) for one receipt")
+    sp.add_argument("receipt_id", help="receipt transaction barcode / order number")
+    sp.add_argument("--no-pdf", action="store_true", help="skip PDF re-render")
+    sp.set_defaults(func=cmd_refresh)
 
     sp = sub.add_parser("all", help="login -> fetch -> online -> parse -> pdf")
     add_common(sp)

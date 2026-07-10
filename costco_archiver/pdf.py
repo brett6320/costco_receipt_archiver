@@ -111,3 +111,26 @@ def render_all_pdfs(
     print(f"  Rendered {rendered} PDF(s), skipped {skipped} existing → {pdf_dir}")
     return {"rendered": rendered, "skipped": skipped,
             "total_pdfs": len(list(pdf_dir.glob('*.pdf'))), "pdf_dir": str(pdf_dir)}
+
+
+def render_one_pdf(receipt_key: str, raw_dir: Path = config.RAW_DIR,
+                   pdf_dir: Path = config.PDF_DIR) -> bool:
+    """Render a single receipt's PDF from its raw JSON. Returns True on success."""
+    config.ensure_dirs()
+    src = raw_dir / f"{receipt_key}.json"
+    if not src.exists():
+        return False
+    try:
+        r = json.loads(src.read_text())
+    except Exception:
+        return False
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        page = browser.new_page()
+        page.set_content(_receipt_html(r), wait_until="load")
+        page.pdf(path=str(pdf_dir / f"{receipt_key}.pdf"), format="Letter",
+                 margin={"top": "0.4in", "bottom": "0.4in",
+                         "left": "0.4in", "right": "0.4in"})
+        browser.close()
+    return True

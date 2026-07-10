@@ -64,8 +64,9 @@ Open the app and you land on **Search**. The UI is **mobile-friendly** and has a
   sortable columns; **Group by item #**; a colored left band per order (so items
   from the same receipt are visually bracketed); a **F/W/O** letter badge per row
   for transaction type (Fuel / Warehouse / Online); item numbers link to a Costco
-  product search (excluded for fuel); and a **Refresh data** button to rebuild
-  outputs from receipts on disk.
+  product search (excluded for fuel); a **Refresh data** button to rebuild all
+  outputs from receipts on disk; and a per-row **↻** to refresh a single
+  receipt's PDF/barcode/Markdown (CLI: `refresh <receipt_id>`).
 - **Collect** — capture credentials (paste a *Copy as cURL*) and run a collection
   back N months (default **36**) with a live progress bar and streaming log.
 
