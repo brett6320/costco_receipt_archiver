@@ -856,6 +856,13 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .pmStats b { color:var(--fg); }
   .pmsvg { background:var(--input-bg); border:1px solid var(--line); border-radius:8px; display:block; }
   .pmline { fill:none; stroke:var(--accent); stroke-width:2; }
+  .pmhit { cursor:crosshair; }
+  .pmcursor { stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; pointer-events:none; }
+  .pmfocus { fill:var(--accent); stroke:var(--card); stroke-width:1.5; pointer-events:none; }
+  .pmtipbg { fill:var(--card); stroke:var(--bd); opacity:.97; }
+  .pmtiptxt { fill:var(--fg); font-size:11px; }
+  .pmtipdate { font-weight:600; }
+  .pmtipprice { fill:var(--muted); }
   .pmavg { stroke:var(--muted); stroke-dasharray:4 3; stroke-width:1; }
   .pmgrid { stroke:var(--line); stroke-width:1; }
   .pmax { fill:var(--muted); font-size:11px; }
@@ -1204,6 +1211,7 @@ async function openPriceModal(item, enc, rid){
     + `<span>Purchases <b>${d.count}</b></span>`
     + (cl ? `<span>This <b>${money(cl)}</b>${dpct!=null?` (${dpct>0?"+":""}${dpct}% vs avg)`:""}</span>` : "");
   $("pmChart").innerHTML = priceChart(d, rid);
+  wirePriceHover($("pmChart").querySelector("svg"));
 }
 // Dependency-free SVG line chart of price over time, with a dashed average line.
 // `rid` (a receipt id) highlights the clicked purchase's point.
@@ -1220,13 +1228,72 @@ function priceChart(d, rid){
   const Y=v=> mT + ih - (y1===y0?ih/2:(v-y0)/(y1-y0)*ih);
   const line = pts.map((p,i)=>(i?"L":"M")+X(days(p.date)).toFixed(1)+" "+Y(p.price).toFixed(1)).join(" ");
   const dots = pts.map(p=>{ const hi = rid && String(p.receipt_id)===String(rid);
-    return `<circle cx="${X(days(p.date)).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="${hi?5:3}" fill="${hi?"#e67e22":"var(--accent)"}"${hi?' stroke="var(--card)" stroke-width="1.5"':""}><title>${p.date}: ${money(p.price)}</title></circle>`;
+    return `<circle class="pmdot" data-date="${p.date}" data-price="${p.price}" cx="${X(days(p.date)).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="${hi?5:3}" fill="${hi?"#e67e22":"var(--accent)"}"${hi?' stroke="var(--card)" stroke-width="1.5"':""}></circle>`;
   }).join("");
   const grid = [y0,(y0+y1)/2,y1].map(v=>`<line x1="${mL}" y1="${Y(v).toFixed(1)}" x2="${W-mR}" y2="${Y(v).toFixed(1)}" class="pmgrid"/><text x="${mL-6}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" class="pmax">${money(v)}</text>`).join("");
   const ay = Y(d.avg).toFixed(1);
   const avg = `<line x1="${mL}" y1="${ay}" x2="${W-mR}" y2="${ay}" class="pmavg"/><text x="${W-mR+4}" y="${ay}" dominant-baseline="middle" class="pmax">avg</text>`;
   const xlab = [pts[0].date, pts[pts.length-1].date].map((dt,i)=>`<text x="${i?(W-mR).toFixed(1):mL}" y="${H-mB+16}" text-anchor="${i?"end":"start"}" class="pmax">${dt}</text>`).join("");
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="pmsvg">${grid}${avg}<path d="${line}" class="pmline"/>${dots}${xlab}</svg>`;
+  // Hover layer: a crosshair, a focus dot, and a date/price tooltip that snap to
+  // the nearest purchase as the cursor moves along the line (wired up after the
+  // SVG is injected — see wirePriceHover). The transparent hit-rect captures the
+  // mouse over the whole plot area.
+  const hover = `<g class="pmhover" style="display:none">`
+    + `<line class="pmcursor" y1="${mT}" y2="${mT+ih}"/>`
+    + `<circle class="pmfocus" r="4.5"/>`
+    + `<g class="pmtip"><rect class="pmtipbg" rx="4"/>`
+    + `<text class="pmtiptxt pmtipdate"></text><text class="pmtiptxt pmtipprice"></text></g></g>`;
+  const hit = `<rect class="pmhit" x="${mL}" y="${mT}" width="${iw}" height="${ih}" fill="transparent" style="pointer-events:all"/>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="pmsvg" `
+    + `data-ytop="${mT}" data-ybot="${mT+ih}" data-xl="${mL}" data-xr="${W-mR}">`
+    + `${grid}${avg}<path d="${line}" class="pmline"/>${dots}${xlab}${hover}${hit}</svg>`;
+}
+
+// Attach line-hover interactivity to a freshly-rendered price chart: as the mouse
+// moves across the plot, snap a crosshair + tooltip to the nearest purchase and
+// show its date and price. Uses the SVG's own coordinate transform so it stays
+// accurate at any rendered width. No-op if the chart has no points.
+function wirePriceHover(svg){
+  if(!svg) return;
+  const dots = [...svg.querySelectorAll('.pmdot')].map(c => ({
+    x:+c.getAttribute('cx'), y:+c.getAttribute('cy'),
+    date:c.getAttribute('data-date'), price:+c.getAttribute('data-price')}));
+  if(!dots.length) return;
+  const hover=svg.querySelector('.pmhover'), cursor=svg.querySelector('.pmcursor'),
+        focus=svg.querySelector('.pmfocus'), tip=svg.querySelector('.pmtip'),
+        bg=svg.querySelector('.pmtipbg'), tDate=svg.querySelector('.pmtipdate'),
+        tPrice=svg.querySelector('.pmtipprice'), hit=svg.querySelector('.pmhit');
+  const xl=+svg.getAttribute('data-xl'), xr=+svg.getAttribute('data-xr'),
+        yTop=+svg.getAttribute('data-ytop'), yBot=+svg.getAttribute('data-ybot');
+  const pt = svg.createSVGPoint();
+  const toUser = evt => { pt.x=evt.clientX; pt.y=evt.clientY;
+    const m=svg.getScreenCTM(); return m ? pt.matrixTransform(m.inverse()) : null; };
+  function move(evt){
+    const u = toUser(evt); if(!u) return;
+    let best=dots[0], bd=Infinity;
+    for(const p of dots){ const dx=Math.abs(p.x-u.x); if(dx<bd){ bd=dx; best=p; } }
+    hover.style.display="";
+    cursor.setAttribute('x1', best.x); cursor.setAttribute('x2', best.x);
+    focus.setAttribute('cx', best.x); focus.setAttribute('cy', best.y);
+    tDate.textContent = best.date;
+    tPrice.textContent = money(best.price);
+    const padX=7, padY=6, lh=14;
+    const w = Math.max(tDate.getComputedTextLength(), tPrice.getComputedTextLength()) + padX*2;
+    const h = lh*2 + padY*2 - 3;
+    let tx = best.x + 12;                 // default: to the right of the point…
+    if(tx + w > xr) tx = best.x - 12 - w; // …flip left near the right edge
+    if(tx < xl) tx = xl;
+    let ty = best.y - h - 10;             // default: above the point…
+    if(ty < yTop) ty = best.y + 12;       // …flip below if it would clip the top
+    if(ty + h > yBot) ty = yBot - h;
+    bg.setAttribute('x', tx); bg.setAttribute('y', ty);
+    bg.setAttribute('width', w); bg.setAttribute('height', h);
+    tDate.setAttribute('x', tx+padX);  tDate.setAttribute('y', ty+padY+10);
+    tPrice.setAttribute('x', tx+padX); tPrice.setAttribute('y', ty+padY+10+lh);
+  }
+  hit.addEventListener('mousemove', move);
+  hit.addEventListener('mouseenter', move);
+  hit.addEventListener('mouseleave', ()=>{ hover.style.display="none"; });
 }
 
 // ---------- Per-order collapse (line view) ----------
