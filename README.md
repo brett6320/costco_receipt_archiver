@@ -72,6 +72,33 @@ Raw archives are kept in `data/raw/` (per-receipt JSON) and `data/captured/`
 
 ## Troubleshooting
 
+### Login stalls on "FIDO Consent" / passkey, or returns HTTP 429
+
+Costco's bot protection (Akamai) and Azure AD B2C sign-in policy fingerprint
+Playwright's *bundled* Chromium — the symptom is a stuck "FIDO Consent" page
+after a security-key/passkey, or a `429 (Too Many Requests)` on the sign-in POST.
+
+Fixes, in order of reliability:
+
+1. **Use your real Chrome** (now the default). If it didn't pick it up, force it:
+   ```bash
+   python -m costco_archiver login --channel chrome   # or: msedge
+   ```
+2. **If you're already 429'd, wait ~15–30 min** — the throttle is per-IP/account
+   and compounds with each retry. Then try again with real Chrome.
+3. **Reset a poisoned session:** `rm -rf .costco_profile` and log in fresh.
+4. **Bypass automated login entirely (most reliable).** Log into costco.com in
+   your *normal* browser as a human, then hand the token to the tool:
+   ```bash
+   python -m costco_archiver paste-token
+   ```
+   It prints a one-line DevTools Console snippet that copies your `idToken` and
+   `clientID` to the clipboard; paste them in and the tool caches them. Then run
+   `python -m costco_archiver fetch`. (Tokens expire in ~1 hour — re-paste if a
+   fetch starts returning 401.)
+
+### Other
+
 - **Login didn't produce credentials.** Complete sign-in fully (reach your account
   page). If the site changed where it stores the token, open DevTools → Network,
   find a request to `ecom-api.costco.com/.../graphql`, copy its
