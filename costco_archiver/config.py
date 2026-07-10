@@ -17,6 +17,11 @@ RAW_DIR = DATA_DIR / "raw"           # raw JSON responses, one file per receipt/
 CAPTURE_DIR = DATA_DIR / "captured"  # raw network captures (fallback harvest)
 OUTPUT_DIR = DATA_DIR / "output"     # parsed CSV / summaries
 
+# Exact request headers captured from the browser's own receipts call. Preferred
+# over reconstructed headers because they include everything the API expects.
+# Tokens live ~15 min, so this file is short-lived by nature.
+API_HEADERS_FILE = DATA_DIR / "api_headers.json"
+
 # Costco endpoints (undocumented; reverse-engineered from the site's own calls).
 GRAPHQL_URL = "https://ecom-api.costco.com/ebusiness/order/v1/orders/graphql"
 SIGNIN_URL = "https://www.costco.com/LogonForm"

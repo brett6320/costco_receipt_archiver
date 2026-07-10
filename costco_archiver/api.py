@@ -67,10 +67,34 @@ query receiptsWithCounts($startDate: String!, $endDate: String!, $documentType: 
 
 
 class CostcoAPI:
-    def __init__(self, creds: Credentials, timeout: float = 60.0):
-        self._client = httpx.Client(
-            headers=creds.headers(), timeout=timeout, http2=True
-        )
+    def __init__(
+        self,
+        creds: Credentials,
+        timeout: float = 60.0,
+        headers: dict | None = None,
+    ):
+        # Prefer exact headers captured from the browser; else reconstruct.
+        hdrs = headers or self._load_saved_headers() or creds.headers()
+        self._client = httpx.Client(headers=hdrs, timeout=timeout, http2=True)
+
+    @staticmethod
+    def _load_saved_headers() -> dict | None:
+        import json
+        from .auth import token_is_expired
+        f = config.API_HEADERS_FILE
+        if not f.exists():
+            return None
+        try:
+            hdrs = json.loads(f.read_text())
+        except Exception:
+            return None
+        # Ignore captured headers whose embedded token has expired (~15 min),
+        # so a fresh env/cached token isn't shadowed by stale headers.
+        auth = hdrs.get("costco-x-authorization") or hdrs.get("authorization") or ""
+        tok = auth.replace("Bearer ", "").strip()
+        if tok and token_is_expired(tok):
+            return None
+        return hdrs
 
     def close(self) -> None:
         self._client.close()

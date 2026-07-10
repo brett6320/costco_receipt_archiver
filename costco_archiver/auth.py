@@ -155,15 +155,29 @@ def login_and_get_credentials(
     else:
         channels = _CHANNEL_ORDER
 
+    explicit = bool(browser_channel)
     with sync_playwright() as p:
         ctx = None
         for ch in channels:
             try:
                 ctx = _launch_context(p, ch)
-                print(f">>> Launched browser ({ch or 'bundled chromium'}).")
+                exe = ""
+                try:
+                    exe = ctx.browser.version if ctx.browser else ""
+                except Exception:
+                    pass
+                label = ch or "bundled chromium"
+                print(f">>> Launched {label} (engine version {exe}).")
                 break
             except Exception as ex:
-                print(f"  (couldn't launch '{ch or 'chromium'}': {ex})")
+                msg = f"  (couldn't launch '{ch or 'chromium'}': {str(ex)[:200]})"
+                if explicit:
+                    # User asked for this specific browser — don't silently fall
+                    # back to Chromium; surface the real reason.
+                    raise RuntimeError(
+                        f"Failed to launch '{ch}'. Is it installed?\n{ex}"
+                    )
+                print(msg)
         if ctx is None:
             raise RuntimeError(
                 "No usable browser. Install Google Chrome, or run "
@@ -176,19 +190,26 @@ def login_and_get_credentials(
             pass
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
+        api_host = config.GRAPHQL_URL.split("/ebusiness")[0]
+
         def on_request(req):
-            if "graphql" in req.url and config.GRAPHQL_URL.split("/graphql")[0] in req.url:
+            if "graphql" not in req.url or api_host not in req.url:
+                return
+            try:
+                h = req.all_headers()
+            except Exception:
                 h = req.headers
-                auth = h.get("costco-x-authorization") or h.get("authorization")
-                cid = h.get("costco-x-wcs-clientid")
-                if auth and cid and "captured" not in captured:
-                    captured["captured"] = Credentials(
-                        id_token=auth.replace("Bearer ", "").strip(),
-                        client_id=cid,
-                        client_identifier=h.get(
-                            "client-identifier", config.CLIENT_IDENTIFIER
-                        ),
-                    )
+            auth = h.get("costco-x-authorization") or h.get("authorization")
+            cid = h.get("costco-x-wcs-clientid")
+            if not (auth and cid):
+                return
+            # Keep the FRESHEST capture (token is only valid ~15 min).
+            captured["headers"] = h
+            captured["captured"] = Credentials(
+                id_token=auth.replace("Bearer ", "").strip(),
+                client_id=cid,
+                client_identifier=h.get("client-identifier", config.CLIENT_IDENTIFIER),
+            )
 
         ctx.on("request", on_request)
 
@@ -225,16 +246,23 @@ def login_and_get_credentials(
                 break
             time.sleep(2)
 
-        # Nudge the app into making a receipts call so we can sniff live headers.
-        if creds is None:
-            try:
-                page.goto(config.RECEIPTS_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(5000)
-            except PWTimeout:
-                pass
-            creds = captured.get("captured") or _extract_from_storage(
-                _read_local_storage(page)
-            )
+        # Always force the app to make a live receipts call so we sniff the
+        # EXACT headers (and a fresh ~15-min token) right before returning.
+        if "headers" not in captured:
+            print(">>> Loading your receipts page to capture a fresh token...")
+            for url in (config.RECEIPTS_URL, config.ORDERS_URL):
+                try:
+                    page.goto(url, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                # Wait up to ~20s for a graphql request to fire.
+                for _ in range(10):
+                    if "headers" in captured:
+                        break
+                    page.wait_for_timeout(2000)
+                if "headers" in captured:
+                    break
+            creds = captured.get("captured") or creds
 
         ctx.close()
 
@@ -245,7 +273,60 @@ def login_and_get_credentials(
             "and set them via COSTCO_ID_TOKEN / COSTCO_CLIENT_ID env vars."
         )
 
+    # Persist the exact captured headers (preferred by the API client) and the
+    # decoded credentials. Both are short-lived because the token is.
+    if captured.get("headers"):
+        _save_api_headers(captured["headers"])
+        print(">>> Captured live API headers (token fresh).")
     if cred_cache is not None:
         cred_cache.write_text(json.dumps(asdict(creds), indent=2))
+    exp = token_expiry(creds.id_token)
+    if exp:
+        import datetime
+        secs = int((exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+        print(f">>> Token valid ~{max(0, secs)//60} more min — fetch now.")
     print(">>> Credentials acquired.\n")
     return creds
+
+
+def _save_api_headers(headers: dict) -> None:
+    """Persist the exact browser request headers used for the receipts API.
+
+    We keep only the headers the API cares about (auth/clientid/costco.*/content
+    -type/user-agent) and drop hop-by-hop / browser-only noise.
+    """
+    keep_prefixes = ("costco", "client-identifier", "content-type", "accept",
+                     "user-agent", "origin", "referer", "authorization")
+    clean = {
+        k: v for k, v in headers.items()
+        if any(k.lower().startswith(p) for p in keep_prefixes)
+        and k.lower() not in ("accept-encoding",)
+    }
+    config.ensure_dirs()
+    config.API_HEADERS_FILE.write_text(json.dumps(clean, indent=2))
+
+
+def token_expiry(id_token: str):
+    """Return the token's exp as an aware UTC datetime, or None if undecodable."""
+    import base64
+    import datetime
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp")
+        if exp:
+            return datetime.datetime.fromtimestamp(exp, datetime.timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def token_is_expired(id_token: str, skew_seconds: int = 30) -> bool:
+    """True if the token is missing/expired (with a small safety skew)."""
+    import datetime
+    exp = token_expiry(id_token)
+    if exp is None:
+        return False  # can't tell; let the API be the judge
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now >= exp - datetime.timedelta(seconds=skew_seconds)

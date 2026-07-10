@@ -33,10 +33,22 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+## ⏱️ Important: tokens live ~15 minutes
+
+Costco's sign-in tokens (Azure AD B2C) expire about **15 minutes** after issue.
+So **don't** log in, walk away, and fetch later — you'll get `401 Unauthorized`.
+Instead do login **and** fetch in one go (the `all` command does this), or run
+`fetch` immediately after `login`. The tool auto-detects an expired cached token
+and re-logs in, and captures a fresh token by loading your receipts page right
+before returning. A full backfill only takes ~1 minute, well inside the window.
+
 ## Usage
 
 ```bash
-# Do everything: login -> fetch receipts -> harvest online orders -> parse
+# Recommended: login + fetch + parse in one shot (no stale-token gap)
+python -m costco_archiver all --skip-online
+
+# Do everything incl. online-order harvest
 python -m costco_archiver all
 
 # …or step by step:

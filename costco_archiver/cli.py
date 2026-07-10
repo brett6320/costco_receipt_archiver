@@ -16,7 +16,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import config
-from .auth import Credentials, login_and_get_credentials
+from .auth import (
+    Credentials,
+    login_and_get_credentials,
+    token_is_expired,
+    token_expiry,
+)
 
 CRED_CACHE = config.DATA_DIR / "credentials.json"
 
@@ -29,11 +34,18 @@ def _load_or_login(
     env_cid = os.environ.get("COSTCO_CLIENT_ID")
     if env_token and env_cid:
         print(">>> Using COSTCO_ID_TOKEN / COSTCO_CLIENT_ID from environment.")
+        if token_is_expired(env_token):
+            print("!!! WARNING: COSTCO_ID_TOKEN is already EXPIRED "
+                  "(these tokens last ~15 min). Re-grab a fresh one.")
         return Credentials(id_token=env_token, client_id=env_cid)
 
     if not force_login and CRED_CACHE.exists():
         data = json.loads(CRED_CACHE.read_text())
-        return Credentials(**data)
+        creds = Credentials(**data)
+        if token_is_expired(creds.id_token):
+            print(">>> Cached token expired (they last ~15 min) — re-logging in.")
+        else:
+            return creds
 
     config.ensure_dirs()
     return login_and_get_credentials(
