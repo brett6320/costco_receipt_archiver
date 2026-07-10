@@ -141,6 +141,103 @@ def cmd_paste_token(args) -> None:
     print("    python -m costco_archiver fetch && python -m costco_archiver parse")
 
 
+def _parse_curl(text: str) -> tuple[str, dict]:
+    """Parse a browser 'Copy as cURL' command into (url, headers).
+
+    Handles bash ($'...') and cmd/PowerShell (^ line continuations) variants.
+    """
+    import shlex
+    t = text.strip()
+    # Normalize line continuations and Chrome's ANSI-C quoting.
+    t = t.replace("\\\n", " ").replace("^\n", " ").replace("`\n", " ")
+    t = t.replace(" $'", " '")
+    try:
+        tokens = shlex.split(t)
+    except ValueError:
+        tokens = shlex.split(t.replace("$'", "'"))
+
+    url, headers = "", {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-H", "--header") and i + 1 < len(tokens):
+            raw = tokens[i + 1]
+            # Skip HTTP/2 pseudo-headers like ':authority: ...'.
+            if ":" in raw and not raw.startswith(":"):
+                k, v = raw.split(":", 1)
+                if k.strip():
+                    headers[k.strip()] = v.strip()
+            i += 2
+            continue
+        if tok in ("-b", "--cookie") and i + 1 < len(tokens):
+            headers["cookie"] = tokens[i + 1]
+            i += 2
+            continue
+        if tok.lower().startswith("http"):
+            url = tok
+        i += 1
+    return url, headers
+
+
+def cmd_import_curl(args) -> None:
+    """Import exact API headers from a DevTools 'Copy as cURL' (bypasses Kasada).
+
+    Costco uses Kasada/Akamai bot detection that blocks automated browsers
+    (429 on sign-in). Instead: log in with your NORMAL browser, open DevTools →
+    Network, load your receipts page, right-click the request to
+    ecom-api.costco.com/.../graphql → Copy → Copy as cURL. Then run this; it reads
+    the cURL from your clipboard and captures every header verbatim.
+    """
+    config.ensure_dirs()
+    text = None
+    if getattr(args, "file", None):
+        text = Path(args.file).read_text()
+    else:
+        print("In your NORMAL browser (logged into costco.com):")
+        print("  1. DevTools → Network tab")
+        print("  2. Open your receipts page so it loads")
+        print("  3. Right-click the '.../orders/graphql' request → Copy → Copy as cURL")
+        print("  4. Come back here (it reads your clipboard)\n")
+        text = _read_clipboard()
+    if not text or "curl" not in text.lower():
+        raise SystemExit("No cURL command found (clipboard empty? use --file <path>).")
+
+    url, headers = _parse_curl(text)
+    # Drop headers that break an httpx replay (auto-managed / HTTP-2 pseudo).
+    _DROP = {"content-length", "accept-encoding", "host", "connection",
+             "transfer-encoding"}
+    headers = {
+        k: v for k, v in headers.items()
+        if not k.startswith(":") and k.lower() not in _DROP
+    }
+    # Normalize header keys to what the API client / capture expects.
+    hl = {k.lower(): v for k, v in headers.items()}
+    auth = hl.get("costco-x-authorization") or hl.get("authorization")
+    cid = hl.get("costco-x-wcs-clientid")
+    if not auth or not cid:
+        raise SystemExit(
+            "That cURL is missing costco-x-authorization / costco-x-wcs-clientid. "
+            "Make sure you copied the request to ecom-api.costco.com/.../graphql "
+            "(not a different request)."
+        )
+
+    config.API_HEADERS_FILE.write_text(json.dumps(headers, indent=2))
+    token = auth.replace("Bearer ", "").strip()
+    creds = Credentials(id_token=token, client_id=cid)
+    CRED_CACHE.write_text(json.dumps(asdict(creds), indent=2))
+
+    print(f"\n>>> Imported {len(headers)} headers from cURL.")
+    exp = token_expiry(token)
+    if exp:
+        import datetime
+        mins = int((exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) // 60
+        print(f">>> Token valid ~{max(0, mins)} more min.")
+    if token_is_expired(token):
+        print("!!! That token is ALREADY expired — recopy a fresh cURL and retry.")
+    else:
+        print(">>> Run NOW:  python -m costco_archiver fetch && python -m costco_archiver parse")
+
+
 def cmd_fetch(args) -> None:
     from .fetch import fetch_all_receipts
 
@@ -201,6 +298,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file", default=None,
                     help="path to a file containing the JSON blob (instead of clipboard)")
     sp.set_defaults(func=cmd_paste_token)
+
+    sp = sub.add_parser("import-curl",
+                        help="import exact headers from DevTools 'Copy as cURL' "
+                             "(best bypass for Kasada/429)")
+    sp.add_argument("--file", default=None,
+                    help="path to a file with the cURL command (instead of clipboard)")
+    sp.set_defaults(func=cmd_import_curl)
 
     sp = sub.add_parser("fetch", help="download warehouse/gas receipts")
     add_common(sp)

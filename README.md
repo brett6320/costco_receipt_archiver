@@ -33,6 +33,32 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+## 🛡️ Costco blocks automated logins (Kasada/Akamai) — use `import-curl`
+
+Costco's sign-in is protected by **Kasada + Akamai** bot detection, which
+fingerprints automated browsers (Playwright/Puppeteer) — even ones driving real
+Chrome — and returns **HTTP 429** on the sign-in policy. So the scripted `login`
+often won't get through.
+
+**The reliable path is to skip automation entirely and copy one real request:**
+
+1. Log into **costco.com in your normal browser** (as a human — no throttling).
+2. Open **DevTools → Network**, then open your **receipts** page so it loads.
+3. Find the request to `ecom-api.costco.com/.../orders/graphql`,
+   **right-click → Copy → Copy as cURL**.
+4. Run:
+   ```bash
+   python -m costco_archiver import-curl        # reads the cURL from your clipboard
+   python -m costco_archiver fetch && python -m costco_archiver parse
+   ```
+
+`import-curl` captures the **exact** headers (fresh token, clientid, cookies) the
+browser used, so the API accepts them. Do steps 3–4 promptly — see below.
+
+> The automated `login` command still exists and may work if you don't have
+> passkeys / aren't being throttled, but `import-curl` is what to reach for when
+> you see 429s.
+
 ## ⏱️ Important: tokens live ~15 minutes
 
 Costco's sign-in tokens (Azure AD B2C) expire about **15 minutes** after issue.
