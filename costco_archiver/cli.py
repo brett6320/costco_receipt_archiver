@@ -291,11 +291,22 @@ def cmd_auth_adduser(args) -> None:
     from . import webauth
     pw = _prompt_new_password(args.username)
     try:
-        secret = webauth.add_user(args.username, pw)
+        secret = webauth.add_user(args.username, pw, role=getattr(args, "role", None)
+                                  or webauth.DEFAULT_ROLE)
     except ValueError as ex:
         raise SystemExit(str(ex))
-    print(f"\n✓ Created user {args.username!r}.")
+    role = webauth.get_role(args.username)
+    print(f"\n✓ Created {role} {args.username!r}.")
     _print_totp_enrollment(args.username, secret)
+
+
+def cmd_auth_setrole(args) -> None:
+    from . import webauth
+    try:
+        webauth.set_role(args.username, args.role)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"✓ {args.username!r} is now {args.role}.")
 
 
 def cmd_auth_passwd(args) -> None:
@@ -329,14 +340,14 @@ def cmd_auth_deluser(args) -> None:
 
 def cmd_auth_users(args) -> None:
     from . import webauth
-    users = webauth.list_users()
+    users = webauth.users_overview()
     if not users:
-        print("No web accounts configured. Add one: "
+        print("No web accounts configured. Add one (first user becomes admin): "
               "python -m costco_archiver auth adduser <name>")
         return
     print("Web accounts:")
     for u in users:
-        print(f"  • {u}")
+        print(f"  • {u['username']:<20} {u['role']}")
 
 
 def cmd_all(args) -> None:
@@ -345,6 +356,12 @@ def cmd_all(args) -> None:
     if not getattr(args, "skip_pdf", False):
         cmd_pdf(args)
     cmd_markdown(args)
+
+
+def webauth_roles() -> tuple[str, ...]:
+    """Valid account roles, imported lazily so `build_parser` stays import-light."""
+    from . import webauth
+    return webauth.VALID_ROLES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -409,11 +426,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="bind port (env: COSTCO_WEB_PORT or PORT; default 8000)")
     sp.set_defaults(func=cmd_web)
 
-    sp = sub.add_parser("auth", help="manage web-UI accounts (password + TOTP MFA)")
+    sp = sub.add_parser("auth", help="manage web-UI accounts (roles + password + TOTP MFA)")
     asub = sp.add_subparsers(dest="auth_command", required=True)
-    a = asub.add_parser("adduser", help="create an account (prompts for password)")
+    a = asub.add_parser("adduser",
+                        help="create an account (prompts for password; first user "
+                             "is always admin)")
     a.add_argument("username")
+    a.add_argument("--role", choices=list(webauth_roles()), default=None,
+                   help="account role (default: operator; the first account is "
+                        "forced to admin)")
     a.set_defaults(func=cmd_auth_adduser)
+    a = asub.add_parser("setrole", help="change an account's role (admin/operator)")
+    a.add_argument("username")
+    a.add_argument("role", choices=list(webauth_roles()))
+    a.set_defaults(func=cmd_auth_setrole)
     a = asub.add_parser("passwd", help="change an account's password")
     a.add_argument("username")
     a.set_defaults(func=cmd_auth_passwd)
@@ -423,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     a = asub.add_parser("deluser", help="delete an account")
     a.add_argument("username")
     a.set_defaults(func=cmd_auth_deluser)
-    a = asub.add_parser("users", help="list accounts")
+    a = asub.add_parser("users", help="list accounts and their roles")
     a.set_defaults(func=cmd_auth_users)
 
     sp = sub.add_parser("markdown",

@@ -23,6 +23,11 @@ from . import config, webauth
 # Session cookie name for the web UI login.
 _COOKIE = "cra_session"
 
+# POST endpoints only admins may call. Operators are read-only: they can search
+# and view, but not run data jobs (capture/collect/reprocess/refresh) or manage
+# accounts (anything under /api/users, gated separately by prefix).
+_ADMIN_POSTS = {"/api/capture", "/api/collect", "/api/reprocess", "/api/refresh_one"}
+
 # --- collection job state (one at a time) -------------------------------------
 _JOB = {"state": "idle", "message": "", "done": 0, "total": 0,
         "saved": 0, "error": None, "summary": None, "log": []}
@@ -420,6 +425,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _current_user(self) -> str | None:
         return webauth.session_user(self._session_token())
 
+    def _current_role(self) -> str:
+        return webauth.session_role(self._session_token())
+
+    def _require_admin(self) -> bool:
+        """True if the caller is an admin; otherwise send 403 and return False."""
+        if self._current_role() == "admin":
+            return True
+        self._send(403, b'{"error":"admin role required"}')
+        return False
+
     def _cookie_header(self, token: str, *, expire: bool = False) -> tuple[str, str]:
         attrs = [f"{_COOKIE}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
         if config.COOKIE_SECURE:
@@ -437,8 +452,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _auth_status(self) -> bytes:
-        return json.dumps({"authenticated": bool(self._current_user()),
-                           "user": self._current_user() or "",
+        user = self._current_user()
+        return json.dumps({"authenticated": bool(user),
+                           "user": user or "",
+                           "role": webauth.get_role(user) if user else "",
                            "users_exist": webauth.users_exist()}).encode()
 
     def do_GET(self):
@@ -484,6 +501,11 @@ class _Handler(BaseHTTPRequestHandler):
                 "date_max": dates[-1] if dates else "",
             }
             self._send(200, json.dumps(meta).encode())
+        elif path == "/api/users":
+            # Admin-only: list accounts and their roles for the Users panel.
+            if not self._require_admin():
+                return
+            self._send(200, json.dumps({"users": webauth.users_overview()}).encode())
         elif path == "/api/reload":
             _Handler.rows = _load_rows()
             self._send(200, json.dumps({"reloaded": len(self.rows)}).encode())
@@ -516,7 +538,8 @@ class _Handler(BaseHTTPRequestHandler):
             if webauth.authenticate(user, str(body.get("password", "")),
                                     str(body.get("code", ""))):
                 token = webauth.create_session(user)
-                self._send(200, json.dumps({"ok": True, "user": user}).encode(),
+                self._send(200, json.dumps(
+                    {"ok": True, "user": user, "role": webauth.get_role(user)}).encode(),
                            extra_headers=[self._cookie_header(token)])
             else:
                 self._send(401, json.dumps(
@@ -532,7 +555,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._current_user():
             self._send(401, b'{"error":"authentication required"}')
             return
-        if path == "/api/capture":
+        # Data jobs and account management are admin-only; operators are read-only.
+        if path in _ADMIN_POSTS and not self._require_admin():
+            return
+        if path.startswith("/api/users"):
+            self._handle_users_post(path)
+        elif path == "/api/capture":
             from .capture import save_from_curl, CaptureError
             body = self._read_json()
             try:
@@ -576,6 +604,69 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(500, json.dumps({"error": str(ex)}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
+
+    # --- user management (admin only) -----------------------------------------
+    def _enroll_payload(self, username: str, secret: str) -> dict:
+        """TOTP enrollment details returned after creating a user / resetting MFA."""
+        return {"secret": secret,
+                "otpauth": webauth.provisioning_uri(username, secret),
+                "issuer": config.AUTH_ISSUER}
+
+    def _handle_users_post(self, path: str) -> None:
+        """Create/update/delete accounts. Admin-only (checked here as well as by
+        the /api/users prefix gate)."""
+        if not self._require_admin():
+            return
+        body = self._read_json()
+        username = str(body.get("username", "")).strip()
+        try:
+            if path == "/api/users":  # create
+                password = str(body.get("password", ""))
+                role = str(body.get("role", "") or webauth.DEFAULT_ROLE)
+                if len(password) < 8:
+                    self._send(400, json.dumps(
+                        {"error": "password must be at least 8 characters"}).encode())
+                    return
+                secret = webauth.add_user(username, password, role=role)
+                out = {"ok": True, "username": username,
+                       "role": webauth.get_role(username),
+                       **self._enroll_payload(username, secret)}
+                self._send(200, json.dumps(out).encode())
+            elif path == "/api/users/update":  # change role and/or password
+                changed = []
+                if body.get("role"):
+                    webauth.set_role(username, str(body["role"]))
+                    changed.append("role")
+                if body.get("password"):
+                    password = str(body["password"])
+                    if len(password) < 8:
+                        self._send(400, json.dumps(
+                            {"error": "password must be at least 8 characters"}).encode())
+                        return
+                    webauth.set_password(username, password)
+                    changed.append("password")
+                if not changed:
+                    self._send(400, json.dumps(
+                        {"error": "nothing to update (role or password)"}).encode())
+                    return
+                self._send(200, json.dumps(
+                    {"ok": True, "username": username, "changed": changed,
+                     "role": webauth.get_role(username)}).encode())
+            elif path == "/api/users/reset_mfa":
+                secret = webauth.reset_totp(username)
+                self._send(200, json.dumps(
+                    {"ok": True, "username": username,
+                     **self._enroll_payload(username, secret)}).encode())
+            elif path == "/api/users/delete":
+                webauth.delete_user(username)
+                self._send(200, json.dumps({"ok": True, "username": username}).encode())
+            else:
+                self._send(404, b'{"error":"not found"}')
+        except ValueError as ex:
+            # Domain guards (duplicate user, unknown user, last-admin protection).
+            self._send(400, json.dumps({"error": str(ex)}).encode())
+        except Exception as ex:
+            self._send(500, json.dumps({"error": str(ex)}).encode())
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -725,6 +816,10 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .inline { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   .msg { font-size:13px; margin-top:8px; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
+  .enroll { background:var(--code); border:1px solid var(--bd); border-radius:6px; padding:10px 12px; margin-top:10px; font-size:13px; line-height:1.7; }
+  .enroll code { word-break:break-all; }
+  #usersTbl td, #usersTbl th { white-space:nowrap; }
+  #usersTbl .btn.secondary { padding:5px 9px; font-size:12px; margin-right:4px; }
   .bar { height:10px; background:var(--chip); border-radius:6px; overflow:hidden; margin:10px 0; }
   .bar > div { height:100%; background:var(--accent); width:0%; transition:width .3s; }
   .log { background:var(--log-bg); color:var(--log-fg); font-family:ui-monospace,Menlo,monospace; font-size:12px; border-radius:6px; padding:10px; height:200px; overflow:auto; white-space:pre-wrap; }
@@ -815,7 +910,8 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="sub" id="meta">loading…</div>
   <div class="tabs">
     <button id="tab-search" class="active" onclick="showTab('search')">Search</button>
-    <button id="tab-collect" onclick="showTab('collect')">Collect</button>
+    <button id="tab-collect" class="hidden" onclick="showTab('collect')">Collect</button>
+    <button id="tab-users" class="hidden" onclick="showTab('users')">Users</button>
     <select id="theme" class="themesel" title="Theme" onchange="setTheme(this.value)">
       <option value="system">🖥 System</option>
       <option value="light">☀ Light</option>
@@ -912,6 +1008,35 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>
     <div class="tablewrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
   </div>
+
+  <!-- ============ USERS (admin only) ============ -->
+  <div id="view-users" class="hidden">
+    <div class="card">
+      <h2>Add user</h2>
+      <p style="font-size:13px;color:var(--muted);margin:0 0 10px">
+        <b>Operator</b> = view &amp; search only. <b>Admin</b> = full access, including
+        collecting data and managing users. The account is created with a fresh TOTP
+        secret shown once below — enroll it in an authenticator app.</p>
+      <div class="filters" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
+        <div><label>Username</label><input id="nu_user" autocomplete="off"></div>
+        <div><label>Password (min 8)</label><input id="nu_pass" type="password" autocomplete="new-password"></div>
+        <div><label>Role</label><select id="nu_role">
+          <option value="operator">operator — view/search</option>
+          <option value="admin">admin — full access</option>
+        </select></div>
+        <div style="display:flex;align-items:flex-end"><button class="btn" onclick="createUser()">Create user</button></div>
+      </div>
+      <div class="msg" id="nu_msg"></div>
+      <div id="nu_enroll" class="enroll hidden"></div>
+    </div>
+    <div class="card">
+      <h2>Accounts</h2>
+      <div class="tablewrap"><table id="usersTbl"><thead>
+        <tr><th>Username</th><th>Role</th><th>MFA</th><th>Created</th><th>Actions</th></tr>
+      </thead><tbody></tbody></table></div>
+      <div class="msg" id="um_msg"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Price-history modal -->
@@ -936,12 +1061,30 @@ async function logout(){
   try{ await fetch("/api/logout", {method:"POST"}); }catch(e){}
   location.href = "/login";
 }
+// Current user's role, set from /api/auth/status. Operators are read-only.
+let ROLE = "";
+function isAdmin(){ return ROLE === "admin"; }
 function showTab(name){
+  // Operators can't reach admin-only tabs — fall back to Search.
+  if((name==="collect" || name==="users") && !isAdmin()) name = "search";
   $("view-collect").classList.toggle("hidden", name!=="collect");
   $("view-search").classList.toggle("hidden", name!=="search");
+  $("view-users").classList.toggle("hidden", name!=="users");
   $("tab-collect").classList.toggle("active", name==="collect");
   $("tab-search").classList.toggle("active", name==="search");
+  $("tab-users").classList.toggle("active", name==="users");
   if(name==="search") run();
+  if(name==="users") loadUsers();
+}
+// Show/hide admin-only controls based on ROLE.
+function applyRole(){
+  const admin = isAdmin();
+  ["tab-collect","tab-users","refreshBtn"].forEach(id => {
+    const el = $(id); if(el) el.classList.toggle("hidden", !admin);
+  });
+  // If an operator is somehow parked on an admin tab, bounce them to Search.
+  if(!admin && (!$("view-collect").classList.contains("hidden")
+             || !$("view-users").classList.contains("hidden"))) showTab("search");
 }
 
 // ---------- Collect ----------
@@ -1192,7 +1335,7 @@ async function run(){
   // onto the Date cell of an order's first line).
   const receiptCell = v => `<a class="pdf" href="/pdf/${encodeURIComponent(v)}" target="_blank" rel="noopener">${v.slice(0,10)}…</a> `
     + fltBtns('rcpt', v, 'this order')
-    + ` <span class="rfr" title="Refresh this receipt's PDF, barcode & Markdown" onclick="refreshOne('${v}', this)">↻</span>`;
+    + (isAdmin() ? ` <span class="rfr" title="Refresh this receipt's PDF, barcode & Markdown" onclick="refreshOne('${v}', this)">↻</span>` : "");
   const cell = (r,k,num) => {
     let v = r[k];
     if(num){
@@ -1356,8 +1499,77 @@ async function loadMeta(){
 async function loadWhoami(){
   try{
     const s = await (await fetch("/api/auth/status")).json();
-    const el = $("whoami"); if(el) el.textContent = s.user || "";
+    ROLE = s.role || "";
+    const el = $("whoami"); if(el) el.textContent = (s.user || "") + (s.role ? ` · ${s.role}` : "");
+    applyRole();
   }catch(e){}
+}
+
+// ---------- Users (admin only) ----------
+function fmtDate(ts){ if(!ts) return ""; try{ return new Date(ts*1000).toISOString().slice(0,10); }catch(e){ return ""; } }
+function enrollHtml(d){
+  return `<b>MFA enrollment for ${d.username||""}</b> — scan or paste into an authenticator app (shown once):<br>`
+    + `Account: <code>${d.issuer||""}:${d.username||""}</code><br>`
+    + `Secret: <code>${d.secret||""}</code><br>`
+    + `otpauth: <code>${d.otpauth||""}</code>`;
+}
+async function loadUsers(){
+  const tb = $("usersTbl").querySelector("tbody");
+  let d;
+  try{ d = await (await api("/api/users")).json(); }catch(e){ return; }
+  const rows = d.users || [];
+  tb.innerHTML = rows.map(u => {
+    const other = u.role==="admin" ? "operator" : "admin";
+    const enc = encodeURIComponent(u.username).replace(/'/g,"%27");
+    return `<tr>
+      <td>${u.username}</td><td>${u.role}</td><td>${u.mfa?"✓":"—"}</td><td>${fmtDate(u.created_at)}</td>
+      <td>
+        <button class="btn secondary" onclick="setUserRole('${enc}','${other}')" title="Switch role to ${other}">→ ${other}</button>
+        <button class="btn secondary" onclick="resetUserPassword('${enc}')" title="Set a new password">Password</button>
+        <button class="btn secondary" onclick="resetUserMfa('${enc}')" title="Regenerate TOTP secret">Reset MFA</button>
+        <button class="btn secondary" onclick="deleteUser('${enc}')" title="Delete account">Delete</button>
+      </td></tr>`;
+  }).join("") || `<tr><td colspan="5" style="color:var(--muted)">No users.</td></tr>`;
+}
+async function usersPost(url, body){
+  const msg = $("um_msg"); msg.className = "msg"; msg.textContent = "Working…";
+  try{
+    const r = await api(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className = "msg err"; msg.textContent = d.error || "Failed"; return d; }
+    msg.className = "msg ok"; msg.textContent = "Done."; loadUsers(); return d;
+  }catch(e){ msg.className = "msg err"; msg.textContent = String(e); }
+}
+async function createUser(){
+  const msg = $("nu_msg"); msg.className = "msg"; msg.textContent = "Creating…";
+  const body = { username: $("nu_user").value.trim(), password: $("nu_pass").value, role: $("nu_role").value };
+  if(!body.username){ msg.className="msg err"; msg.textContent="Username required."; return; }
+  try{
+    const r = await api("/api/users", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className = "msg err"; msg.textContent = d.error || "Failed"; return; }
+    msg.className = "msg ok"; msg.textContent = `Created ${d.role} ${d.username}.`;
+    $("nu_enroll").classList.remove("hidden"); $("nu_enroll").innerHTML = enrollHtml(d);
+    $("nu_user").value = ""; $("nu_pass").value = "";
+    loadUsers();
+  }catch(e){ msg.className = "msg err"; msg.textContent = String(e); }
+}
+async function setUserRole(enc, role){ await usersPost("/api/users/update", { username: decodeURIComponent(enc), role }); }
+async function resetUserPassword(enc){
+  const pw = prompt("New password (min 8 characters):");
+  if(pw == null) return;
+  await usersPost("/api/users/update", { username: decodeURIComponent(enc), password: pw });
+}
+async function resetUserMfa(enc){
+  const u = decodeURIComponent(enc);
+  if(!confirm(`Reset MFA for ${u}? Their old codes stop working.`)) return;
+  const d = await usersPost("/api/users/reset_mfa", { username: u });
+  if(d && d.ok){ $("nu_enroll").classList.remove("hidden"); $("nu_enroll").innerHTML = enrollHtml(d); }
+}
+async function deleteUser(enc){
+  const u = decodeURIComponent(enc);
+  if(!confirm(`Delete ${u}? This cannot be undone.`)) return;
+  await usersPost("/api/users/delete", { username: u });
 }
 // If a collection is already running when the page loads, resume showing status.
 (async ()=>{
