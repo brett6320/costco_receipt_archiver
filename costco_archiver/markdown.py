@@ -19,9 +19,11 @@ from urllib.parse import quote_plus
 
 from . import config
 from .barcode_util import barcode_svg
-from .parse import _load_receipts, _receipt_date, _num, order_type, _item_is_fuel
+from .parse import (_load_receipts, _receipt_date, _num, order_type, _item_is_fuel,
+                    item_description, discount_ref, tax_ref, resolve_discount,
+                    is_tax_exempt, fuel_gallons, warehouse_name, tax_code_label)
 
-_TYPE_ICON = {"fuel": "⛽ Fuel", "online": "🌐 Online", "warehouse": "🏬 Warehouse"}
+_TYPE_ICON = {"fuel": "⛽ Fuel", "warehouse": "🏬 Warehouse", "discount": "🏷 Discount"}
 
 _SEARCH = "https://www.costco.com/CatalogSearch?dept=All&keyword={}"
 
@@ -52,7 +54,7 @@ def _item_link(item_number: str, description: str) -> str:
 
 def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
     date = _receipt_date(r)
-    warehouse = r.get("warehouseName") or r.get("warehouseShortName") or ""
+    warehouse = warehouse_name(r)
     barcode = r.get("transactionBarcode") or ""
     lines = [
         f"# Receipt — {warehouse}",
@@ -79,17 +81,43 @@ def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
         "| Item # | Description | Qty | Amount | Tax | Detail |",
         "|---|---|--:|--:|:--:|---|",
     ]
-    for it in r.get("itemArray") or []:
+    items = r.get("itemArray") or []
+    tax_codes: dict[str, str] = {}  # code -> label, for the legend below the table
+    has_exempt = False
+    for it in items:
         num = str(it.get("itemNumber") or "").strip()
-        desc = " ".join(
-            x for x in (it.get("itemDescription01"), it.get("itemDescription02")) if x
-        ).strip()
-        qty = it.get("unit") or 1
+        desc = item_description(it)
+        ref = discount_ref(desc)
+        tref = tax_ref(desc) if ref is None else None
+        is_child = ref is not None or tref is not None
+        is_fuel = otype == "fuel" and _item_is_fuel(it)
+        link_desc = desc
+        if ref is not None:  # discount: resolve the "/1967470" reference
+            _, pdesc = resolve_discount(ref, items)
+            desc = f"↳ Discount → {pdesc or ref}"
+            qty = it.get("unit") or 1
+        elif tref is not None:  # additional per-item tax: keep label, resolve 'T/…'
+            pref, label = tref
+            _, pdesc = resolve_discount(pref, items)
+            desc = f"↳ {label} → {pdesc or pref}"
+            qty = it.get("unit") or 1
+        elif is_fuel:  # grade @ price/gal, quantity = derived gallons
+            desc = f"{desc} @ ${_num(it.get('itemUnitPriceAmount')):.3f}/gal"
+            qty = f"{fuel_gallons(it):.3f}"
+        else:
+            qty = it.get("unit") or 1
+        # An 'E' at the far left of the receipt line marks a tax-exempt item.
+        exempt = " ᴱ" if is_tax_exempt(it) else ""
+        if exempt:
+            has_exempt = True
         amount = _money(it.get("amount"))
-        tax = it.get("taxFlag") or ""
-        # Exclude product-lookup metadata for gas/fuel line items.
-        detail = "" if (otype == "fuel" and _item_is_fuel(it)) else _item_link(num, desc)
-        lines.append(f"| {num} | {desc} | {qty} | {amount} | {tax} | {detail} |")
+        # Per-line tax-category code (blank for discount/tax child lines).
+        tax = "" if is_child else str(it.get("taxFlag") or "")
+        if tax:
+            tax_codes[tax] = tax_code_label(tax)
+        # Exclude product-lookup metadata for gas/fuel and discount/tax lines.
+        detail = "" if (is_child or is_fuel) else _item_link(num, link_desc)
+        lines.append(f"| {num} | {desc}{exempt} | {qty} | {amount} | {tax} | {detail} |")
     lines += [
         "",
         f"| | | | |",
@@ -100,6 +128,13 @@ def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
     ]
     if _num(r.get("instantSavings")):
         lines.append(f"| | | **Instant savings** | {_money(r.get('instantSavings'))} |")
+    # Legend for the per-line tax codes / exempt marker (the UI shows these as
+    # hover tooltips; a static page can't, so spell them out).
+    legend = [f"**{c}** = {lbl}" for c, lbl in sorted(tax_codes.items()) if lbl]
+    if has_exempt:
+        legend.append("**ᴱ** = tax-exempt item")
+    if legend:
+        lines += ["", "*Tax codes: " + " · ".join(legend) + "*"]
     # Link to the rendered PDF if it exists.
     if barcode and (config.PDF_DIR / f"{_safe(r)}.pdf").exists():
         lines += ["", f"[📄 PDF](../../pdfs/{_safe(r)}.pdf)"]
@@ -145,7 +180,7 @@ def generate_markdown(
     for r in receipts:
         name = _safe(r)
         date = _receipt_date(r)
-        warehouse = r.get("warehouseName") or r.get("warehouseShortName") or ""
+        warehouse = warehouse_name(r)
         n_items = r.get("totalItemCount") or len(r.get("itemArray") or [])
         idx.append(
             f"| [{date}](receipts/{name}.md) | {warehouse} | {n_items} "

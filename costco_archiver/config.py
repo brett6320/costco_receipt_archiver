@@ -13,8 +13,7 @@ PROFILE_DIR = ROOT / ".costco_profile"
 
 # Where downloaded artifacts land.
 DATA_DIR = ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"           # raw JSON responses, one file per receipt/order
-CAPTURE_DIR = DATA_DIR / "captured"  # raw network captures (fallback harvest)
+RAW_DIR = DATA_DIR / "raw"           # raw JSON responses, one file per receipt
 OUTPUT_DIR = DATA_DIR / "output"     # parsed CSV / summaries
 PDF_DIR = DATA_DIR / "pdfs"          # per-receipt PDF archive (+ captured PDFs)
 
@@ -27,10 +26,6 @@ API_HEADERS_FILE = DATA_DIR / "api_headers.json"
 # fetch can replay Costco's own GraphQL query/variables verbatim across date
 # windows instead of relying on a hard-coded query that may drift.
 API_REQUEST_FILE = DATA_DIR / "api_request.json"
-
-# Same, but for the ONLINE-orders query (getOnlineOrders) — a separate endpoint
-# shape from warehouse receipts, captured independently.
-API_REQUEST_ONLINE_FILE = DATA_DIR / "api_request_online.json"
 
 # Decoded token/clientid cache (short-lived; token ~15 min).
 CRED_CACHE_FILE = DATA_DIR / "credentials.json"
@@ -55,6 +50,24 @@ try:
 except ValueError:
     WEB_PORT = 8000
 
+# --- Web authentication (password + TOTP MFA) --------------------------------
+# Account store for the web UI (usernames, password hashes, TOTP secrets, and a
+# reserved slot for future passkeys). Local-only; keep it out of version control.
+WEB_USERS_FILE = DATA_DIR / "web_users.json"
+
+# Label shown in authenticator apps when enrolling TOTP.
+AUTH_ISSUER = os.environ.get("COSTCO_AUTH_ISSUER", "Costco Receipt Archiver")
+
+# Session lifetime (seconds) and cookie hardening. Set COSTCO_WEB_HTTPS=1 when
+# serving over TLS (directly or behind a proxy) so the session cookie is marked
+# Secure. Sessions live in server memory, so a restart signs everyone out.
+try:
+    SESSION_TTL_SECONDS = int(os.environ.get("COSTCO_SESSION_TTL") or 43200)  # 12h
+except ValueError:
+    SESSION_TTL_SECONDS = 43200
+COOKIE_SECURE = (os.environ.get("COSTCO_WEB_HTTPS", "").lower()
+                 in ("1", "true", "yes", "on"))
+
 # A modern desktop UA reduces the chance of being served a degraded/blocked page.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -63,5 +76,5 @@ USER_AGENT = (
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, RAW_DIR, CAPTURE_DIR, OUTPUT_DIR, PDF_DIR):
+    for d in (DATA_DIR, RAW_DIR, OUTPUT_DIR, PDF_DIR):
         d.mkdir(parents=True, exist_ok=True)

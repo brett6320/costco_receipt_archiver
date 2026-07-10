@@ -25,8 +25,8 @@ def _receipt(barcode, date, items):
 
 
 def run(tmp: Path):
-    raw = tmp / "raw"; cap = tmp / "cap"; out = tmp / "out"
-    for d in (raw, cap, out):
+    raw = tmp / "raw"; out = tmp / "out"
+    for d in (raw, out):
         d.mkdir(parents=True, exist_ok=True)
 
     # Receipt with the SAME sku scanned twice (two real lines) + another item.
@@ -44,7 +44,7 @@ def run(tmp: Path):
     # (e.g. imported via PDF after being fetched via API) -> must NOT double count.
     (raw / "BC1_again.json").write_text(json.dumps(r1))
 
-    summary = parse_mod.parse_all(raw_dir=raw, capture_dir=cap, output_dir=out)
+    summary = parse_mod.parse_all(raw_dir=raw, output_dir=out)
 
     with (out / "line_items.csv").open() as fh:
         lines = list(csv.DictReader(fh))

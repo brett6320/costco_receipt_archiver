@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import threading
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from . import config
+from . import config, webauth
+
+# Session cookie name for the web UI login.
+_COOKIE = "cra_session"
 
 # --- collection job state (one at a time) -------------------------------------
 _JOB = {"state": "idle", "message": "", "done": 0, "total": 0,
@@ -100,14 +105,6 @@ def _run_collection(months_back: int, do_pdf: bool):
         summary = fetch_all_receipts(creds, months_back=months_back, progress_cb=cb)
         _log(f"Fetched {summary.get('receipts_saved_this_run', 0)} new; "
              f"{summary.get('total_receipts_on_disk', 0)} total on disk.")
-        # Online orders (if that request template was captured).
-        from .fetch import fetch_online_orders
-        online = fetch_online_orders(creds, months_back=months_back, progress_cb=cb)
-        if online.get("skipped"):
-            _log("No online-orders request captured — skipping online orders. "
-                 "(Capture the Orders & Purchases → Online graphql request too.)")
-        else:
-            _log(f"Online orders: {online.get('online_orders_saved', 0)} saved.")
         _set_job(state="parsing", message="Building CSVs, index & Markdown…")
         _log("Parsing → CSVs…")
         parse_all()
@@ -169,8 +166,8 @@ def _job_snapshot():
         return dict(_JOB)
 
 # Columns to free-text search across.
-_TEXT_FIELDS = ["item_number", "description", "warehouse", "receipt_id",
-                "doc_type", "source", "department"]
+_TEXT_FIELDS = ["item_number", "description", "warehouse", "warehouse_number",
+                "receipt_id", "doc_type", "source", "department"]
 
 
 def _load_rows() -> list[dict]:
@@ -195,9 +192,98 @@ def _num(v, default=None):
         return default
 
 
+def _parse_query(text: str):
+    """Parse the search box into (negate, field, value) filters.
+
+    Plain words / "quoted phrases" match text (substring across fields). Field
+    tokens item: / store: / rcpt: / desc: match that field exactly. A leading '-'
+    on any token excludes. E.g.  kirkland -store:358 item:1610256
+    """
+    out = []
+    for tok in re.findall(r'-?\w+:"[^"]*"|-?"[^"]*"|-?\w+:\S+|-?\S+', text or ""):
+        negate = tok.startswith("-")
+        if negate:
+            tok = tok[1:]
+        m = re.match(r"(\w+):(.*)$", tok, re.S)
+        field, val = (m.group(1).lower(), m.group(2)) if m else ("text", tok)
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1]
+        val = val.strip().lower()
+        if val:
+            out.append((negate, field, val))
+    return out
+
+
+def _query_match(r: dict, field: str, val: str) -> bool:
+    if field == "item":
+        return val == str(r.get("item_number", "")).lower()
+    if field in ("store", "wh"):
+        return val == str(r.get("warehouse_number", "")).lower()
+    if field == "rcpt":
+        return val == str(r.get("receipt_id", "")).lower()
+    if field == "desc":
+        return val == str(r.get("description", "")).lower()
+    hay = " ".join(str(r.get(f, "")) for f in _TEXT_FIELDS).lower()
+    return val in hay
+
+
+def _num0(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _item_history(rows: list[dict], item: str, desc: str) -> dict:
+    """Net price-over-time for one item (by item number, or description for NONUM
+    items). Purchases are aggregated per receipt and the item's discounts on that
+    receipt are subtracted, so the price reflects what was actually paid per unit."""
+    # Discounts applied to each (receipt, item), summed (their amounts are negative).
+    adj: dict[tuple, float] = {}
+    for r in rows:
+        if str(r.get("order_type", "")) == "discount" and r.get("discount_ref"):
+            k = (r.get("receipt_id", ""), str(r.get("discount_ref")))
+            adj[k] = adj.get(k, 0.0) + _num0(r.get("amount"))
+
+    agg: dict[str, dict] = {}
+    label = ""
+    for r in rows:
+        if item:
+            if str(r.get("item_number", "")) != item:
+                continue
+        elif desc:
+            if str(r.get("description", "")) != desc:
+                continue
+        else:
+            continue
+        if str(r.get("order_type", "")) in ("discount", "tax"):
+            continue
+        rid = r.get("receipt_id", "")
+        e = agg.setdefault(rid, {"date": r.get("date", ""), "amt": 0.0, "qty": 0.0})
+        e["amt"] += _num0(r.get("amount"))
+        e["qty"] += _num0(r.get("unit_qty"))
+        label = label or r.get("description", "")
+
+    pts = []
+    for rid, e in agg.items():
+        net = e["amt"] + (adj.get((rid, item), 0.0) if item else 0.0)
+        qty = e["qty"] or 1
+        price = round(net / qty, 2)
+        if price <= 0 or not e["date"]:
+            continue
+        pts.append({"date": e["date"], "price": price, "receipt_id": rid})
+    pts.sort(key=lambda x: x["date"])
+    prices = [p["price"] for p in pts]
+    n = len(prices)
+    return {
+        "item_number": item, "description": label, "points": pts, "count": n,
+        "avg": round(sum(prices) / n, 2) if n else 0,
+        "min": min(prices) if prices else 0, "max": max(prices) if prices else 0,
+    }
+
+
 def _search(rows: list[dict], q: dict) -> dict:
-    text = (q.get("q", [""])[0] or "").strip().lower()
-    terms = [t for t in text.split() if t]
+    filters = _parse_query(q.get("q", [""])[0] or "")
     date_from = (q.get("date_from", [""])[0] or "").strip()
     date_to = (q.get("date_to", [""])[0] or "").strip()
     min_price = _num(q.get("min_price", [""])[0])
@@ -205,14 +291,22 @@ def _search(rows: list[dict], q: dict) -> dict:
     item_number = (q.get("item_number", [""])[0] or "").strip()
     warehouse = (q.get("warehouse", [""])[0] or "").strip().lower()
     otype_filter = (q.get("order_type", [""])[0] or "").strip().lower()
+    tax = (q.get("tax", [""])[0] or "").strip().lower()
     sort = (q.get("sort", ["date"])[0] or "date")
     order = (q.get("order", ["desc"])[0] or "desc")
     group = (q.get("group", ["0"])[0] == "1")
+    discounted_only = (q.get("discounted", ["0"])[0] == "1")
+    # Items that carry an associated discount: (receipt_id, discounted item #).
+    disc_items = set()
+    if discounted_only:
+        for r in rows:
+            if str(r.get("order_type", "")) == "discount" and r.get("discount_ref"):
+                disc_items.add((r.get("receipt_id", ""), str(r.get("discount_ref"))))
 
     def keep(r):
-        if terms:
-            hay = " ".join(str(r.get(f, "")) for f in _TEXT_FIELDS).lower()
-            if not all(t in hay for t in terms):
+        for negate, field, val in filters:
+            # positive token must be present; negative token must be absent.
+            if _query_match(r, field, val) == negate:
                 return False
         if date_from and (r.get("date") or "") < date_from:
             return False
@@ -220,9 +314,21 @@ def _search(rows: list[dict], q: dict) -> dict:
             return False
         if item_number and item_number not in str(r.get("item_number", "")):
             return False
-        if warehouse and warehouse not in str(r.get("warehouse", "")).lower():
+        # Warehouse filter matches either the name or the (atomic) number.
+        if warehouse and warehouse not in str(r.get("warehouse", "")).lower() \
+                and warehouse not in str(r.get("warehouse_number", "")).lower():
             return False
         if otype_filter and str(r.get("order_type", "")).lower() != otype_filter:
+            return False
+        if tax == "y" and str(r.get("tax_flag", "")).upper() != "Y":
+            return False
+        if tax == "n" and str(r.get("tax_flag", "")).upper() != "N":
+            return False
+        if tax == "exempt" and str(r.get("tax_exempt", "")).upper() != "Y":
+            return False
+        # "Has discount": keep discount lines and the items they apply to.
+        if discounted_only and str(r.get("order_type", "")) != "discount" \
+                and (r.get("receipt_id", ""), str(r.get("item_number", ""))) not in disc_items:
             return False
         amt = r.get("amount", 0.0)
         if min_price is not None and amt < min_price:
@@ -269,12 +375,18 @@ def _search(rows: list[dict], q: dict) -> dict:
     except TypeError:
         result.sort(key=lambda x: str(x.get(sort_key, "")), reverse=reverse)
 
+    # Total is the NET spend: discount lines lower it via their true (negative)
+    # amount — never the positive per-line net shown in the table. Discounts are
+    # also surfaced on their own as a separate stat.
     total_spent = round(sum(r.get("amount", 0.0) for r in matched), 2)
+    total_discounts = round(sum(r.get("amount", 0.0) for r in matched
+                                if str(r.get("order_type", "")) == "discount"), 2)
     limit = int(q.get("limit", ["1000"])[0])
     return {
         "count": len(result),
         "line_item_matches": len(matched),
         "total_spent": total_spent,
+        "total_discounts": total_discounts,
         "grouped": group,
         "rows": result[:limit],
     }
@@ -286,28 +398,88 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
-    def _send(self, code, body: bytes, ctype="application/json"):
+    def _send(self, code, body: bytes, ctype="application/json", extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    # --- auth helpers ---------------------------------------------------------
+    def _session_token(self) -> str | None:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            return SimpleCookie(raw).get(_COOKIE).value  # type: ignore[union-attr]
+        except Exception:
+            return None
+
+    def _current_user(self) -> str | None:
+        return webauth.session_user(self._session_token())
+
+    def _cookie_header(self, token: str, *, expire: bool = False) -> tuple[str, str]:
+        attrs = [f"{_COOKIE}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
+        if config.COOKIE_SECURE:
+            attrs.append("Secure")
+        if expire:
+            attrs.append("Max-Age=0")
+        else:
+            attrs.append(f"Max-Age={config.SESSION_TTL_SECONDS}")
+        return ("Set-Cookie", "; ".join(attrs))
+
+    def _redirect(self, location: str):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _auth_status(self) -> bytes:
+        return json.dumps({"authenticated": bool(self._current_user()),
+                           "user": self._current_user() or "",
+                           "users_exist": webauth.users_exist()}).encode()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        # Public (no session required): the login page and auth status probe.
+        if path == "/login":
+            self._send(200, _LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+            return
+        if path == "/api/auth/status":
+            self._send(200, self._auth_status())
+            return
+        # Everything else is gated behind a valid session.
+        if not self._current_user():
+            if path == "/":
+                self._redirect("/login")
+            else:
+                self._send(401, b'{"error":"authentication required"}')
+            return
         if path == "/":
             self._send(200, _PAGE.encode(), "text/html; charset=utf-8")
         elif path == "/api/search":
             q = parse_qs(parsed.query)
             out = json.dumps(_search(self.rows, q)).encode()
             self._send(200, out)
+        elif path == "/api/item_history":
+            q = parse_qs(parsed.query)
+            item = (q.get("item", [""])[0] or "").strip()
+            desc = (q.get("desc", [""])[0] or "").strip()
+            out = json.dumps(_item_history(self.rows, item, desc)).encode()
+            self._send(200, out)
         elif path == "/api/meta":
             warehouses = sorted({r.get("warehouse", "") for r in self.rows if r.get("warehouse")})
+            # Count physical warehouses by their (atomic) number, not name — one
+            # warehouse can appear under several name spellings.
+            wh_nums = {r.get("warehouse_number", "") for r in self.rows if r.get("warehouse_number")}
             dates = sorted({r.get("date", "") for r in self.rows if r.get("date")})
             meta = {
                 "total_line_items": len(self.rows),
                 "warehouses": warehouses,
+                "warehouse_count": len(wh_nums) if wh_nums else len(warehouses),
                 "date_min": dates[0] if dates else "",
                 "date_max": dates[-1] if dates else "",
             }
@@ -337,6 +509,29 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        # Public auth endpoints (no existing session required).
+        if path == "/api/login":
+            body = self._read_json()
+            user = str(body.get("username", "")).strip()
+            if webauth.authenticate(user, str(body.get("password", "")),
+                                    str(body.get("code", ""))):
+                token = webauth.create_session(user)
+                self._send(200, json.dumps({"ok": True, "user": user}).encode(),
+                           extra_headers=[self._cookie_header(token)])
+            else:
+                self._send(401, json.dumps(
+                    {"ok": False, "error": "Invalid username, password, or code."}
+                ).encode())
+            return
+        if path == "/api/logout":
+            webauth.destroy_session(self._session_token())
+            self._send(200, json.dumps({"ok": True}).encode(),
+                       extra_headers=[self._cookie_header("", expire=True)])
+            return
+        # All other POSTs require a valid session.
+        if not self._current_user():
+            self._send(401, b'{"error":"authentication required"}')
+            return
         if path == "/api/capture":
             from .capture import save_from_curl, CaptureError
             body = self._read_json()
@@ -388,14 +583,87 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     _Handler.rows = _load_rows()
     if not _Handler.rows:
         print("No parsed data found. Run `fetch` then `parse` first.")
+    if not webauth.users_exist():
+        print("⚠ No web accounts configured — the login page will reject everyone.\n"
+              "  Create one first:  python -m costco_archiver auth adduser <name>")
     httpd = ThreadingHTTPServer((host, port), _Handler)
     url = f"http://{host}:{port}"
-    print(f"Serving {len(_Handler.rows)} line items at {url}  (Ctrl-C to stop)")
+    print(f"Serving {len(_Handler.rows)} line items at {url}  "
+          f"(login required · Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
         httpd.shutdown()
+
+
+_LOGIN_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Costco Receipt Archiver</title>
+<script>(function(){ document.documentElement.setAttribute('data-theme',
+  localStorage.getItem('theme') || 'system'); })();</script>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1c2126; --muted:#6b7280; --card:#fff; --bd:#d8dbe0;
+    --accent:#005daa; --on-accent:#fff; --input-bg:#fff; --err:#c5221f; color-scheme:light; }
+  @media (prefers-color-scheme: dark){ :root[data-theme="system"]{
+    --bg:#0f141a; --fg:#e6e9ee; --muted:#9aa4b2; --card:#161b22; --bd:#2b3440;
+    --accent:#3b82f6; --input-bg:#0f141a; --err:#ff6b60; color-scheme:dark; } }
+  :root[data-theme="dark"]{ --bg:#0f141a; --fg:#e6e9ee; --muted:#9aa4b2; --card:#161b22;
+    --bd:#2b3440; --accent:#3b82f6; --input-bg:#0f141a; --err:#ff6b60; color-scheme:dark; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; min-height:100vh;
+    display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:26px 24px;
+    width:340px; max-width:92vw; box-shadow:0 10px 30px rgba(0,0,0,.12); }
+  h1 { font-size:17px; margin:0 0 4px; }
+  p.sub { font-size:12px; color:var(--muted); margin:0 0 18px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; }
+  input { width:100%; padding:9px 10px; border:1px solid var(--bd); border-radius:8px;
+    font-size:16px; background:var(--input-bg); color:var(--fg); }
+  button { width:100%; margin-top:18px; background:var(--accent); color:var(--on-accent);
+    border:0; padding:11px; border-radius:8px; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  .err { color:var(--err); font-size:13px; margin-top:12px; min-height:16px; }
+  .note { font-size:12px; color:var(--muted); margin-top:14px; line-height:1.5; }
+  code { background:rgba(128,128,128,.15); padding:1px 5px; border-radius:4px; }
+</style></head><body>
+  <form class="card" id="f" autocomplete="on">
+    <h1>Costco Receipt Archiver</h1>
+    <p class="sub">Sign in to view your receipts.</p>
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autofocus>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password">
+    <label for="c">Authenticator code</label>
+    <input id="c" name="code" inputmode="numeric" autocomplete="one-time-code"
+           pattern="[0-9]*" placeholder="6-digit TOTP">
+    <button id="btn" type="submit">Sign in</button>
+    <div class="err" id="err"></div>
+    <div class="note hidden" id="setup">No accounts exist yet. Create one from a terminal:
+      <br><code>python -m costco_archiver auth adduser &lt;name&gt;</code></div>
+  </form>
+<script>
+  const $ = id => document.getElementById(id);
+  fetch("/api/auth/status").then(r=>r.json()).then(s=>{
+    if(s && s.authenticated){ location.href = "/"; return; }
+    if(s && !s.users_exist){ $("setup").classList.remove("hidden"); }
+  }).catch(()=>{});
+  $("f").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    $("err").textContent = ""; $("btn").disabled = true;
+    try{
+      const r = await fetch("/api/login", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({username:$("u").value, password:$("p").value, code:$("c").value})});
+      const d = await r.json();
+      if(r.ok && d.ok){ location.href = "/"; return; }
+      $("err").textContent = d.error || "Sign in failed.";
+    }catch(ex){ $("err").textContent = String(ex); }
+    $("btn").disabled = false; $("c").value = ""; $("c").focus();
+  });
+</script>
+<style>.hidden{display:none;}</style>
+</body></html>"""
 
 
 _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -443,6 +711,8 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .tabs button.active { background:var(--card); color:var(--accent); font-weight:600; }
   .themesel { background:rgba(255,255,255,.2); color:var(--on-accent); border:0; border-radius:6px; padding:6px 8px; font-size:12px; cursor:pointer; }
   .themesel option { color:#111; }
+  .whoami { font-size:12px; opacity:.9; }
+  .whoami:not(:empty)::before { content:"👤 "; }
   .wrap { padding:16px 18px; }
   .card { background:var(--card); border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:14px; }
   .card h2 { margin:0 0 8px; font-size:15px; }
@@ -476,6 +746,41 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   a.pdf { color:var(--accent); text-decoration:none; }
   .rfr { cursor:pointer; color:var(--muted); user-select:none; font-size:13px; }
   .rfr:hover { color:var(--accent); }
+  /* Inline include(＋)/exclude(−) filter buttons */
+  .flt { cursor:pointer; color:var(--muted); user-select:none; font-size:11px; font-weight:700; padding:0 1px; }
+  .flt:hover { color:var(--accent); }
+  /* Clickable price cell → price-history modal */
+  td.pricelink { cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
+  td.pricelink:hover { color:var(--accent); }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; z-index:1000; padding:12px; }
+  .modalCard { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px 18px 18px; width:620px; max-width:96vw; box-shadow:0 20px 60px rgba(0,0,0,.35); }
+  .modalHead { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; font-size:14px; }
+  .modalX { cursor:pointer; color:var(--muted); font-size:15px; }
+  .modalX:hover { color:var(--accent); }
+  .pmStats { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin-bottom:12px; }
+  .pmStats b { color:var(--fg); }
+  .pmsvg { background:var(--input-bg); border:1px solid var(--line); border-radius:8px; display:block; }
+  .pmline { fill:none; stroke:var(--accent); stroke-width:2; }
+  .pmavg { stroke:var(--muted); stroke-dasharray:4 3; stroke-width:1; }
+  .pmgrid { stroke:var(--line); stroke-width:1; }
+  .pmax { fill:var(--muted); font-size:11px; }
+  .pmEmpty { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
+  /* Collapse trigger = the receipt's start-of-order block icon (the swatch). */
+  td.ord.ordtrig { cursor:pointer; }
+  td.ord.ordtrig > span.sw { transition:box-shadow .1s, transform .1s; }
+  td.ord.ordtrig:hover > span.sw { box-shadow:0 0 0 2px var(--accent); transform:scale(1.15); }
+  tr.osum td { background:var(--rowhover); font-variant-numeric:tabular-nums; }
+  tr.osum .desc { color:var(--muted); }
+  /* Tax-exempt "E" chip + discount hierarchy marker */
+  .tebadge { display:inline-block; font-size:10px; font-weight:700; line-height:1.4;
+    color:var(--muted); border:1px solid var(--bd); border-radius:3px; padding:0 3px;
+    margin-right:5px; vertical-align:middle; }
+  .disc-mark { color:var(--muted); margin-right:2px; }
+  tr.discrow td { color:var(--muted); }
+  /* Taxable Y/N column */
+  td.taxcol, th.taxcol { text-align:center; }
+  .tax-y { font-weight:700; }
+  .tax-n { color:var(--muted); }
   .toggle { display:flex; align-items:center; gap:6px; }
   .hidden { display:none; }
   /* Same-order visual delineator */
@@ -516,6 +821,8 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <option value="light">☀ Light</option>
       <option value="dark">🌙 Dark</option>
     </select>
+    <span id="whoami" class="whoami" title="Signed in"></span>
+    <button class="themesel" title="Sign out" onclick="logout()">Sign out</button>
   </div>
 </header>
 
@@ -571,7 +878,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="card">
       <div class="filters">
         <div style="grid-column:1/-1"><label>Search (any term: description, item #, warehouse…)</label>
-          <input id="q" placeholder="e.g. olive oil  ·  1610256  ·  kirkland"></div>
+          <input id="q" placeholder="olive oil · item:1610256 · -store:358 (– excludes)"></div>
         <div><label>Date from</label><input id="date_from" type="date"></div>
         <div><label>Date to</label><input id="date_to" type="date"></div>
         <div><label>Item number</label><input id="item_number" placeholder="exact/partial"></div>
@@ -579,17 +886,26 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
           <option value="">All</option>
           <option value="warehouse">Warehouse</option>
           <option value="fuel">Fuel</option>
-          <option value="online">Online</option>
         </select></div>
-        <div><label>Warehouse</label><input id="warehouse" placeholder="contains…"></div>
+        <div><label>Tax</label><select id="tax">
+          <option value="">All</option>
+          <option value="y">Taxable (Y)</option>
+          <option value="n">Non-taxable (N)</option>
+          <option value="exempt">Tax-exempt (E)</option>
+        </select></div>
+        <div><label>Warehouse</label><input id="warehouse" placeholder="name or #…"></div>
         <div><label>Min price</label><input id="min_price" type="number" step="0.01"></div>
         <div><label>Max price</label><input id="max_price" type="number" step="0.01"></div>
       </div>
       <div class="row2">
         <span class="stat">Matches: <b id="count">0</b></span>
         <span class="stat">Total: <b id="total">$0.00</b></span>
+        <span class="stat">Discounts: <b id="discounts">$0.00</b></span>
         <label class="toggle"><input type="checkbox" id="group"> Group by item #</label>
+        <label class="toggle" title="Only items that have an associated discount"><input type="checkbox" id="discounted"> Has discount</label>
+        <label class="toggle"><input type="checkbox" id="collapseOrders"> Collapse orders</label>
         <span style="flex:1"></span>
+        <button class="btn secondary" onclick="exportExcel()" title="Download the current view as a spreadsheet (CSV, opens in Excel)">⬇ Export</button>
         <button class="btn secondary" id="refreshBtn" onclick="reprocess()" title="Rebuild data & metadata from receipts on disk">↻ Refresh data</button>
         <button class="btn secondary" id="reset">Reset</button>
       </div>
@@ -598,8 +914,28 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 </div>
 
+<!-- Price-history modal -->
+<div id="priceModal" class="modal hidden" onclick="if(event.target===this) closePriceModal()">
+  <div class="modalCard">
+    <div class="modalHead"><b id="pmTitle"></b><span class="modalX" title="Close" onclick="closePriceModal()">✕</span></div>
+    <div id="pmStats" class="pmStats"></div>
+    <div id="pmChart"></div>
+    <div id="pmEmpty" class="pmEmpty hidden">No price history for this item.</div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
+// Any API 401 means the session lapsed — bounce to the login page.
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  if(r.status === 401){ location.href = "/login"; throw new Error("unauthorized"); }
+  return r;
+}
+async function logout(){
+  try{ await fetch("/api/logout", {method:"POST"}); }catch(e){}
+  location.href = "/login";
+}
 function showTab(name){
   $("view-collect").classList.toggle("hidden", name!=="collect");
   $("view-search").classList.toggle("hidden", name!=="search");
@@ -619,7 +955,7 @@ async function capture(){
     if(!r.ok){ msg.className="msg err"; msg.textContent = d.error || "Capture failed"; }
     else {
       msg.className = d.expired ? "msg err" : "msg ok";
-      const kindTxt = d.kind==="online" ? " (online-orders request)" : (d.kind==="warehouse" && d.has_query ? " (warehouse receipts request)" : "");
+      const kindTxt = d.has_query ? " (warehouse receipts request)" : "";
       msg.textContent = (d.expired ? "⚠ Token already expired — recopy a fresh cURL. " : "✓ Captured. ")
         + `${d.headers} headers` + (d.has_query?", query captured":"") + kindTxt + `, token ~${d.token_minutes} min left.`;
     }
@@ -681,21 +1017,124 @@ async function reprocess(){
   poll=setInterval(pollStatus,1000); pollStatus();
 }
 
+// Inline filters append a token to the search box (visible + editable there),
+// then let showTab('search') fire a single run(). Field tokens (item/store/rcpt)
+// match exactly; an empty field is a text phrase; a leading '-' excludes.
+function _q(v){ v = String(v).replace(/"/g, ""); return /\s/.test(v) ? '"'+v+'"' : v; }
+function _tokAdd(tok){
+  const cur = $("q").value.trim();
+  $("q").value = cur ? cur + " " + tok : tok;
+  showTab("search");
+}
+// field: "item" | "store" | "rcpt" | "" (text phrase). Value is URI-encoded at
+// the call site so quotes/specials survive the inline handler.
+function fInc(field, enc){ _tokAdd((field?field+":":"") + _q(decodeURIComponent(enc))); }
+function fExc(field, enc){ _tokAdd("-" + (field?field+":":"") + _q(decodeURIComponent(enc))); }
+// Render a ＋ (include) / − (exclude) button pair for a filterable cell value.
+function fltBtns(field, val, label){
+  const enc = encodeURIComponent(String(val)).replace(/'/g, "%27");
+  return `<span class="flt" title="Only ${label}" onclick="fInc('${field}','${enc}')">＋</span>`
+       + `<span class="flt" title="Exclude ${label}" onclick="fExc('${field}','${enc}')">－</span>`;
+}
+
+// ---------- Price-history modal ----------
+function closePriceModal(){ $("priceModal").classList.add("hidden"); }
+async function openPriceModal(item, enc, rid){
+  const desc = decodeURIComponent(enc || "");
+  const p = new URLSearchParams();
+  if(item) p.set("item", item); else p.set("desc", desc);
+  let d;
+  try { d = await (await api("/api/item_history?"+p.toString())).json(); }
+  catch(e){ return; }
+  $("pmTitle").textContent = (d.description || desc || ("Item "+item)) + (item ? "  ·  #"+item : "");
+  $("priceModal").classList.remove("hidden");
+  if(!d.count){ $("pmStats").innerHTML=""; $("pmChart").innerHTML=""; $("pmEmpty").classList.remove("hidden"); return; }
+  $("pmEmpty").classList.add("hidden");
+  // The clicked purchase's net per-unit price (found by its receipt).
+  const m = rid ? d.points.find(x=>String(x.receipt_id)===String(rid)) : null;
+  const cl = m ? m.price : 0;
+  const dpct = (cl && d.avg) ? Math.round((cl-d.avg)/d.avg*1000)/10 : null;
+  $("pmStats").innerHTML =
+      `<span>Average <b>${money(d.avg)}</b></span>`
+    + `<span>Low <b>${money(d.min)}</b></span>`
+    + `<span>High <b>${money(d.max)}</b></span>`
+    + `<span>Purchases <b>${d.count}</b></span>`
+    + (cl ? `<span>This <b>${money(cl)}</b>${dpct!=null?` (${dpct>0?"+":""}${dpct}% vs avg)`:""}</span>` : "");
+  $("pmChart").innerHTML = priceChart(d, rid);
+}
+// Dependency-free SVG line chart of price over time, with a dashed average line.
+// `rid` (a receipt id) highlights the clicked purchase's point.
+function priceChart(d, rid){
+  const pts = d.points, W=580, H=280, mL=56, mR=54, mT=16, mB=34;
+  const iw=W-mL-mR, ih=H-mT-mB;
+  const days = s => { const a=s.split("-").map(Number); return Date.UTC(a[0],a[1]-1,a[2])/86400000; };
+  const xs = pts.map(p=>days(p.date));
+  let x0=Math.min(...xs), x1=Math.max(...xs); if(x0===x1){ x0-=1; x1+=1; }
+  const ys = pts.map(p=>p.price);
+  let y0=Math.min(...ys, d.avg), y1=Math.max(...ys, d.avg);
+  const pad=(y1-y0)*0.12 || (y1*0.1) || 1; y0=Math.max(0,y0-pad); y1+=pad;
+  const X=v=> mL + (x1===x0?iw/2:(v-x0)/(x1-x0)*iw);
+  const Y=v=> mT + ih - (y1===y0?ih/2:(v-y0)/(y1-y0)*ih);
+  const line = pts.map((p,i)=>(i?"L":"M")+X(days(p.date)).toFixed(1)+" "+Y(p.price).toFixed(1)).join(" ");
+  const dots = pts.map(p=>{ const hi = rid && String(p.receipt_id)===String(rid);
+    return `<circle cx="${X(days(p.date)).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="${hi?5:3}" fill="${hi?"#e67e22":"var(--accent)"}"${hi?' stroke="var(--card)" stroke-width="1.5"':""}><title>${p.date}: ${money(p.price)}</title></circle>`;
+  }).join("");
+  const grid = [y0,(y0+y1)/2,y1].map(v=>`<line x1="${mL}" y1="${Y(v).toFixed(1)}" x2="${W-mR}" y2="${Y(v).toFixed(1)}" class="pmgrid"/><text x="${mL-6}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" class="pmax">${money(v)}</text>`).join("");
+  const ay = Y(d.avg).toFixed(1);
+  const avg = `<line x1="${mL}" y1="${ay}" x2="${W-mR}" y2="${ay}" class="pmavg"/><text x="${W-mR+4}" y="${ay}" dominant-baseline="middle" class="pmax">avg</text>`;
+  const xlab = [pts[0].date, pts[pts.length-1].date].map((dt,i)=>`<text x="${i?(W-mR).toFixed(1):mL}" y="${H-mB+16}" text-anchor="${i?"end":"start"}" class="pmax">${dt}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="pmsvg">${grid}${avg}<path d="${line}" class="pmline"/>${dots}${xlab}</svg>`;
+}
+
+// ---------- Per-order collapse (line view) ----------
+// Orders whose line items are hidden (showing just a total + count summary).
+// Kept across re-renders so a search/sort doesn't reopen collapsed orders.
+const collapsed = new Set();
+let lastOrderIds = [];
+function _oidSel(id){ return (window.CSS && CSS.escape) ? CSS.escape(id) : id; }
+function applyCollapse(id){
+  const c = collapsed.has(id), esc = _oidSel(id);
+  document.querySelectorAll(`tr.oline[data-oid="${esc}"]`).forEach(tr => tr.classList.toggle("hidden", c));
+  const s = document.querySelector(`tr.osum[data-oid="${esc}"]`);
+  if(s) s.classList.toggle("hidden", !c);
+}
+function toggleOrder(id, ev){
+  if(ev) ev.stopPropagation();
+  if(collapsed.has(id)) collapsed.delete(id); else collapsed.add(id);
+  applyCollapse(id);
+  // Un-check "Collapse orders" if the user manually re-opened one.
+  const all = $("collapseOrders");
+  if(all && all.checked && lastOrderIds.some(x => !collapsed.has(x))) all.checked = false;
+}
+function collapseAll(state){
+  lastOrderIds.forEach(id => { if(state) collapsed.add(id); else collapsed.delete(id); applyCollapse(id); });
+}
+
 // ---------- Search ----------
-const inputs = ["q","date_from","date_to","item_number","order_type","warehouse","min_price","max_price"];
+const inputs = ["q","date_from","date_to","item_number","order_type","tax","warehouse","min_price","max_price"];
 let sort = "date", order = "desc";
 const COLS = {
   line: [["date","Date",0],["order_type","Type",0],["item_number","Item #",0],["description","Description",0],
-         ["unit_qty","Qty",1],["unit_price","Unit $",1],["amount","Amount",1],
-         ["warehouse","Warehouse",0],["receipt_id","Receipt",0]],
+         ["unit_qty","Qty",1],["unit_price","Unit $",1],["amount","Amount",1],["tax_flag","Tax",0],
+         ["warehouse","Warehouse",0],["warehouse_number","Wh #",0],["receipt_id","Receipt",0]],
   group: [["order_type","Type",0],["item_number","Item #",0],["description","Description",0],
           ["times_purchased","Times",1],["total_qty","Total Qty",1],
           ["total_spent","Total $",1],["last_price","Last $",1],
           ["first_purchase","First",0],["last_purchase","Last",0]],
 };
-// Letter font-icon per transaction type: F(uel) / W(arehouse) / O(nline).
-const TYPE_BADGE = { fuel:["F","#c9821f"], online:["O","#2d7dd2"], warehouse:["W","#2e7d46"] };
+// Letter font-icon per transaction type: F(uel) / W(arehouse) / D(iscount) / T(ax).
+const TYPE_BADGE = { fuel:["F","#c9821f"], warehouse:["W","#2e7d46"], discount:["D","#9b59b6"], tax:["T","#c0392b"] };
 function typeBadge(t){ const [l,c]=TYPE_BADGE[t]||["W","#2e7d46"]; return `<span class="tbadge" style="--tc:${c}" title="${t||'warehouse'}">${l}</span>`; }
+// Discount/tax lines are "child" lines nested under the item they reference.
+function isChild(ot){ return ot==="discount" || ot==="tax"; }
+// Costco's per-line taxFlag is a tax-category code, not a plain Y/N.
+const TAX_TIP = {
+  "Y": "Taxable — standard rate",
+  "N": "Not taxed",
+  "3": "Special tax category (Costco code 3)",
+  "4": "Special tax category (Costco code 4 — e.g. liquor)",
+};
+function taxTip(code){ return TAX_TIP[code] || (code ? "Costco tax code "+code : ""); }
 function money(v){ return "$"+(Number(v)||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 // Well-separated color per order: golden-angle hue steps (137.5°) by display
 // order guarantee consecutive orders are far apart on the wheel; alternating
@@ -722,19 +1161,24 @@ function qs(){
   const p = new URLSearchParams();
   inputs.forEach(k => { if($(k).value) p.set(k, $(k).value); });
   if($("group").checked) p.set("group","1");
+  if($("discounted").checked) p.set("discounted","1");
   p.set("sort", sort); p.set("order", order);
   return p.toString();
 }
+let lastData = null;
 async function run(){
-  const data = await (await fetch("/api/search?"+qs())).json();
+  const data = await (await api("/api/search?"+qs())).json();
+  lastData = data;
   $("count").textContent = data.count.toLocaleString() + (data.grouped ? " items" : " lines");
   $("total").textContent = money(data.total_spent);
+  const disc = data.total_discounts || 0;
+  $("discounts").textContent = (disc ? "−" : "") + money(Math.abs(disc));
   const cols = data.grouped ? COLS.group : COLS.line;
   const grouped = data.grouped;
   const thead = $("tbl").querySelector("thead");
   const leadTh = grouped ? "" : `<th title="Order"></th>`;
   thead.innerHTML = "<tr>" + leadTh + cols.map(([k,label,num])=>
-    `<th data-k="${k}" class="${num?'num':''} ${k===sort?'sorted '+(order==='asc'?'asc':''):''}">${label}</th>`
+    `<th data-k="${k}" class="${num?'num':''} ${k==='tax_flag'?'taxcol':''} ${k===sort?'sorted '+(order==='asc'?'asc':''):''}">${label}</th>`
   ).join("") + "</tr>";
   thead.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => {
     const k = th.dataset.k;
@@ -742,44 +1186,184 @@ async function run(){
     run();
   });
   const rows = data.rows;
-  // Assign each distinct order an index in display order for well-spread colors.
-  const orderIdx = {}; let _oi = 0;
-  if(!grouped) for(const r of rows){ const id=r.receipt_id||""; if(!(id in orderIdx)) orderIdx[id]=_oi++; }
   const tb = $("tbl").querySelector("tbody");
-  tb.innerHTML = rows.map((r,i) => {
-    const cells = cols.map(([k,label,num])=>{
-      let v = r[k];
-      if(num) v = (k.includes("price")||k.includes("spent")||k==="amount") ? money(v) : (Number(v)||0).toLocaleString();
-      else if(k==="order_type") v = typeBadge(r.order_type);
-      // Exclude product metadata (lookup link) for gas/fuel purchases.
-      else if(k==="item_number" && v) v = (r.order_type==="fuel") ? String(v) : itemLink(v);
-      else if(k==="receipt_id" && v) v = `<a class="pdf" href="/pdf/${encodeURIComponent(v)}" target="_blank" rel="noopener">${v.slice(0,10)}…</a> <span class="rfr" title="Refresh this receipt's PDF, barcode & Markdown" onclick="refreshOne('${v}', this)">↻</span>`;
-      else v = (v==null?"":String(v));
-      return `<td class="${num?'num':''} ${k==='description'?'desc':''}">${v}</td>`;
-    }).join("");
-    if(grouped) return `<tr>${cells}</tr>`;
-    // Order delineator: color band per receipt; bracket at group start/end.
+
+  // Render one <td> for a line/group row (`caretId` prepends a collapse caret
+  // onto the Date cell of an order's first line).
+  const receiptCell = v => `<a class="pdf" href="/pdf/${encodeURIComponent(v)}" target="_blank" rel="noopener">${v.slice(0,10)}…</a> `
+    + fltBtns('rcpt', v, 'this order')
+    + ` <span class="rfr" title="Refresh this receipt's PDF, barcode & Markdown" onclick="refreshOne('${v}', this)">↻</span>`;
+  const cell = (r,k,num) => {
+    let v = r[k];
+    if(num){
+      // Discount/tax line: show the adjustment in Unit $, and the item's total
+      // combined with it (net for a discount, plus-tax for a tax) in Amount.
+      if(isChild(r.order_type) && k==="unit_price") v = money(r.amount);
+      else if(isChild(r.order_type) && k==="amount") v = money((Number(r._parentAmt)||0) + (Number(r.amount)||0));
+      // Fuel: price/gallon carries 3 decimals (e.g. $3.459); qty is gallons.
+      else if(r.order_type==="fuel" && k==="unit_price") v = "$"+(Number(v)||0).toFixed(3);
+      else if(r.order_type==="fuel" && k==="unit_qty") v = (Number(v)||0).toFixed(3);
+      else v = (k.includes("price")||k.includes("spent")||k==="amount") ? money(v) : (Number(v)||0).toLocaleString();
+    }
+    else if(k==="order_type") v = typeBadge(r.order_type);
+    // Exclude product metadata (lookup link) for gas/fuel purchases.
+    else if(k==="item_number" && v){ const num2 = String(v);
+      // Discount/tax lines carry a code, not a product #: show it plain (no lookup).
+      v = isChild(r.order_type) ? num2
+        : (((r.order_type==="fuel") ? num2 : itemLink(num2))
+           + " " + fltBtns('item', num2, 'item '+num2)); }
+    else if(k==="description" && v){ const d = String(v);
+      const te = (r.tax_exempt==="Y") ? `<span class="tebadge" title="Tax-exempt (E)">E</span>` : "";
+      const child = isChild(r.order_type);
+      const dm = child ? `<span class="disc-mark" title="Applies to the item above">↳</span> ` : "";
+      // No filter buttons on discount/tax lines (don't filter on their names).
+      const filt = child ? "" : " " + fltBtns('', d, 'this description');
+      v = te + dm + d + filt; }
+    else if(k==="warehouse_number" && v){ const wn = String(v);
+      v = wn + " " + fltBtns('store', wn, 'store '+wn); }
+    else if(k==="receipt_id" && v) v = receiptCell(v);
+    // Taxable indicator (the code printed at the far right of the receipt line);
+    // hover shows what the code means.
+    else if(k==="tax_flag") v = r.tax_flag ? `<span class="${r.tax_flag==='Y'?'tax-y':'tax-n'}" title="${taxTip(r.tax_flag)}">${r.tax_flag}</span>` : "";
+    else v = (v==null?"":String(v));
+    let cls = (num?"num ":"") + (k==="tax_flag"?"taxcol ":"") + (k==="description"?"desc ":"");
+    let attr = "";
+    // Price cells (Unit $ / grouped Last $) open a price-history chart for the item.
+    if(!isChild(r.order_type) && r.item_number && (k==="unit_price"||k==="last_price") && (Number(r[k])||0)>0){
+      cls += "pricelink ";
+      const enc = encodeURIComponent(String(r.description||"")).replace(/'/g,"%27");
+      attr = ` title="Price history" onclick="openPriceModal('${String(r.item_number)}','${enc}','${String(r.receipt_id||"")}')"`;
+    }
+    return `<td class="${cls.trim()}"${attr}>${v}</td>`;
+  };
+
+  if(grouped){
+    tb.innerHTML = rows.map(r => `<tr>${cols.map(([k,l,num])=>cell(r,k,num)).join("")}</tr>`).join("");
+    lastOrderIds = [];
+    return;
+  }
+
+  // Line view: group rows into per-order blocks (first-appearance order) so each
+  // transaction can collapse to a single summary row (item count + order total).
+  const blocks = [], byId = {}; let oi = 0;
+  for(const r of rows){
     const id = r.receipt_id || "";
-    const col = orderColor(orderIdx[id] || 0);
-    const first = (rows[i-1]||{}).receipt_id !== id;
-    const last  = (rows[i+1]||{}).receipt_id !== id;
-    const lead = `<td class="ord"><span class="band"></span>${first?'<span class="sw"></span>':''}</td>`;
-    return `<tr class="ord ${first?'ordf':''} ${last?'ordl':''}" style="--oc:${col}" title="Order ${id}">${lead}${cells}</tr>`;
-  }).join("");
+    let b = byId[id];
+    if(!b){ b = byId[id] = {id, idx: oi++, lines: [], total: 0}; blocks.push(b); }
+    b.lines.push(r); b.total += Number(r.amount) || 0;
+  }
+  lastOrderIds = blocks.map(b => b.id);
+
+  let html = "";
+  for(const b of blocks){
+    const id = b.id, col = orderColor(b.idx), isC = collapsed.has(id);
+    // Nest each discount/tax line directly under the item it references
+    // (discount_ref); children with no resolvable parent fall to the order's end.
+    const discByRef = {};
+    b.lines.forEach(r => { if(isChild(r.order_type)){ const k=r.discount_ref||""; (discByRef[k]=discByRef[k]||[]).push(r); } });
+    const usedRefs = new Set(), ordered = [];
+    b.lines.forEach(r => {
+      if(isChild(r.order_type)) return;
+      ordered.push(r);
+      const ds = discByRef[r.item_number];
+      if(ds && !usedRefs.has(r.item_number)){
+        // Remember the item's total so a child line can show the combined price
+        // (item total ± the adjustment) in its Amount column.
+        ds.forEach(d => { d._parentAmt = r.amount; ordered.push(d); });
+        usedRefs.add(r.item_number);
+      }
+    });
+    b.lines.filter(r => isChild(r.order_type) && (!r.discount_ref || !usedRefs.has(r.discount_ref)))
+           .forEach(d => ordered.push(d));
+    b.lines = ordered;
+    const n = b.lines.length, m = b.lines[0];
+    const nItems = b.lines.filter(r => !isChild(r.order_type)).length;  // discount/tax aren't items
+    // Collapsed summary row (hidden while expanded): item count + order total. Its
+    // start-of-order block icon expands the order back open.
+    const sum = cols.map(([k,l,num]) => {
+      let v = "";
+      if(k==="date") v = String(m.date||"");
+      else if(k==="order_type") v = typeBadge(m.order_type);
+      else if(k==="description") v = `<b>${nItems} item${nItems===1?'':'s'}</b>`;
+      else if(k==="amount") v = `<b>${money(b.total)}</b>`;
+      else if(k==="warehouse") v = String(m.warehouse||"");
+      else if(k==="receipt_id" && id) v = receiptCell(id);
+      return `<td class="${num?'num':''} ${k==='tax_flag'?'taxcol':''} ${k==='description'?'desc':''}">${v}</td>`;
+    }).join("");
+    const sumLead = `<td class="ord ordtrig" title="Expand order" onclick="toggleOrder('${id}',event)"><span class="band"></span><span class="sw"></span></td>`;
+    html += `<tr class="ord osum ordf ordl ${isC?'':'hidden'}" data-oid="${id}" style="--oc:${col}" title="Order ${id}">${sumLead}${sum}</tr>`;
+    // Expanded line rows (hidden while collapsed). The first row's block icon —
+    // the swatch marking the start of the receipt — collapses the order.
+    b.lines.forEach((r,j) => {
+      const first = j===0, last = j===n-1, child = isChild(r.order_type);
+      const cells = cols.map(([k,l,num]) => cell(r, k, num)).join("");
+      const lead = first
+        ? `<td class="ord ordtrig" title="Collapse order" onclick="toggleOrder('${id}',event)"><span class="band"></span><span class="sw"></span></td>`
+        : `<td class="ord"><span class="band"></span></td>`;
+      html += `<tr class="ord oline ${child?'discrow':''} ${first?'ordf':''} ${last?'ordl':''} ${isC?'hidden':''}" data-oid="${id}" style="--oc:${col}" title="Order ${id}">${lead}${cells}</tr>`;
+    });
+  }
+  tb.innerHTML = html;
+  // Keep the bulk "Collapse orders" toggle authoritative for newly-matched orders.
+  if($("collapseOrders").checked) collapseAll(true);
 }
 const debounce = (fn,ms)=>{ let t; return ()=>{ clearTimeout(t); t=setTimeout(fn,ms); }; };
 inputs.forEach(k => { $(k).addEventListener("input", debounce(run,250)); $(k).addEventListener("change", run); });
 $("group").addEventListener("change", ()=>{ sort = $("group").checked?"total_spent":"date"; run(); });
-$("reset").onclick = ()=>{ inputs.forEach(k=>$(k).value=""); $("group").checked=false; sort="date"; order="desc"; run(); };
+$("collapseOrders").addEventListener("change", ()=> collapseAll($("collapseOrders").checked));
+$("discounted").addEventListener("change", run);
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") closePriceModal(); });
+$("reset").onclick = ()=>{ inputs.forEach(k=>$(k).value=""); $("group").checked=false;
+  $("discounted").checked=false; $("collapseOrders").checked=false; collapsed.clear();
+  sort="date"; order="desc"; run(); };
+
+// ---------- Export current view to a spreadsheet (CSV, opens in Excel) ----------
+function csvCell(v){
+  v = (v==null ? "" : String(v));
+  return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
+}
+// Mirror the table's display values so the export matches the current view:
+// discounts show the discount in Unit $ and the item's net in Amount; fuel keeps
+// gallons / 3-decimal price. Everything else is the raw field value.
+function exportVal(r,k){
+  if(isChild(r.order_type)){
+    if(k==="unit_price") return Number(r.amount)||0;
+    if(k==="amount") return (Number(r._parentAmt)||0) + (Number(r.amount)||0);
+  }
+  return r[k];
+}
+function exportExcel(){
+  if(!lastData || !lastData.rows || !lastData.rows.length){ return; }
+  const cols = lastData.grouped ? COLS.group : COLS.line;
+  const rows = [cols.map(c => csvCell(c[1])).join(",")];
+  for(const r of lastData.rows){
+    rows.push(cols.map(([k]) => csvCell(exportVal(r,k))).join(","));
+  }
+  const csv = "\ufeff" + rows.join("\r\n");    // BOM so Excel reads UTF-8
+  const blob = new Blob([csv], {type:"text/csv;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "costco-receipts.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+}
 
 async function loadMeta(){
-  const m = await (await fetch("/api/meta")).json();
-  $("meta").textContent = `${m.total_line_items.toLocaleString()} line items · ${m.date_min||"?"} → ${m.date_max||"?"} · ${m.warehouses.length} warehouses`;
+  const m = await (await api("/api/meta")).json();
+  const whn = (m.warehouse_count!=null ? m.warehouse_count : m.warehouses.length);
+  $("meta").textContent = `${m.total_line_items.toLocaleString()} line items · ${m.date_min||"?"} → ${m.date_max||"?"} · ${whn} warehouses`;
+}
+async function loadWhoami(){
+  try{
+    const s = await (await fetch("/api/auth/status")).json();
+    const el = $("whoami"); if(el) el.textContent = s.user || "";
+  }catch(e){}
 }
 // If a collection is already running when the page loads, resume showing status.
 (async ()=>{
   const sel = document.getElementById('theme');
   if(sel) sel.value = localStorage.getItem('theme') || 'system';
+  loadWhoami();
   loadMeta();
   run();  // Search is the landing page — populate it immediately.
   const s = await (await fetch("/api/collect/status")).json();

@@ -1,4 +1,4 @@
-"""Parse raw receipts (+ captured online orders) into deduplicated CSVs.
+"""Parse raw receipts into deduplicated CSVs.
 
 Outputs (in data/output/):
   line_items.csv      - every purchased line item, one row each, newest first.
@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from . import config
 
@@ -39,46 +40,161 @@ def _item_is_fuel(it: dict) -> bool:
 
 
 def order_type(receipt: dict) -> str:
-    """Classify a receipt as 'online', 'fuel', or 'warehouse'."""
+    """Classify a receipt as 'fuel' or 'warehouse'."""
     dt = str(receipt.get("documentType") or "").lower()
     tt = str(receipt.get("transactionType") or "").lower()
     wh = str(receipt.get("warehouseName") or receipt.get("warehouseShortName") or "").lower()
-    src = str(receipt.get("source") or "").lower()
-    if "online" in src or wh == "online" or "online" in dt:
-        return "online"
     if ("gas" in dt or "fuel" in dt or "gas" in tt or "gas" in wh or "fuel" in wh
             or any(_item_is_fuel(it) for it in receipt.get("itemArray") or [])):
         return "fuel"
     return "warehouse"
 
 
+def item_description(it: dict) -> str:
+    """Joined line-item description (both description fields)."""
+    return " ".join(
+        x for x in (it.get("itemDescription01"), it.get("itemDescription02")) if x
+    ).strip()
+
+
+def warehouse_name(receipt: dict) -> str:
+    """Store name in a normalized alpha form: strip the trailing '#1262'
+    store-number suffix (and any stray '#') and Title-Case it, so the variants
+    "W TAMPA #1262", "W TAMPA" and "W Tampa" all collapse to "W Tampa". The number
+    itself is kept separately as warehouse_number."""
+    raw = receipt.get("warehouseName") or receipt.get("warehouseShortName") or ""
+    name = re.sub(r"#\s*\d+", "", raw).replace("#", "")
+    return re.sub(r"\s{2,}", " ", name).strip().title()
+
+
+def fuel_gallons(it: dict) -> float:
+    """Gallons pumped for a fuel line. Costco's API doesn't return the quantity
+    (the raw `unit` is always 1), so derive it from total ÷ price-per-gallon."""
+    price = _num(it.get("itemUnitPriceAmount"))
+    amt = _num(it.get("amount"))
+    return round(amt / price, 3) if price else _num(it.get("unit"))
+
+
+def is_tax_exempt(it: dict) -> bool:
+    """Costco marks tax-exempt line items with an 'E' identifier — the 'E' printed
+    at the far left of the receipt line."""
+    return str(it.get("itemIdentifier") or "").upper() == "E"
+
+
+# Costco's per-line taxFlag is a tax-category code, not a plain Y/N. These labels
+# mirror the tooltips shown in the web UI (web.py TAX_TIP) so the Markdown/PDF
+# receipts carry the same explanation the UI does on hover.
+TAX_CODE_LABELS = {
+    "Y": "Taxable — standard rate",
+    "N": "Not taxed",
+    "3": "Special tax category (Costco code 3)",
+    "4": "Special tax category (Costco code 4 — e.g. liquor)",
+}
+
+
+def tax_code_label(code) -> str:
+    """Human-readable meaning of a per-line taxFlag code ('' if no code)."""
+    code = str(code or "").strip()
+    if not code:
+        return ""
+    return TAX_CODE_LABELS.get(code, f"Costco tax code {code}")
+
+
+def discount_ref(desc: str):
+    """A discount line encodes the discounted item after a leading '/', e.g.
+    '/1967470' or '/ DECK BOX'. Return that reference token, or None if the line
+    isn't a discount."""
+    d = (desc or "").strip()
+    return d[1:].strip() if d.startswith("/") else None
+
+
+_TAX_RE = re.compile(r"\bT/\s*(\d+)")
+
+
+def tax_ref(desc: str):
+    """An additional per-item tax line references its item as 'T/<item #>' inside
+    the description (e.g. 'LIQUOR LITER TAX T/1472221') — the inverse of a discount
+    (positive amount). Return (item_ref, label_without_ref), or None."""
+    m = _TAX_RE.search(desc or "")
+    if not m:
+        return None
+    return m.group(1), _TAX_RE.sub("", desc).strip()
+
+
+def resolve_discount(ref: str, items: list[dict]) -> tuple[str, str]:
+    """Resolve a discount reference to the (item_number, description) it applies to
+    within the same receipt. Numeric refs match by item number; text refs match by
+    a unique case-insensitive description substring. Returns ('', '') if unresolved."""
+    prods = [(str(it.get("itemNumber") or "").strip(), item_description(it))
+             for it in items if not item_description(it).startswith("/")]
+    key = (ref or "").replace(" ", "")
+    if key.isdigit():
+        for num, d in prods:
+            if num == key:
+                return num, d
+        return "", ""
+    rl = (ref or "").strip().lower()
+    if rl:
+        hits = [(num, d) for num, d in prods if d and rl in d.lower()]
+        if len(hits) == 1:
+            return hits[0]
+    return "", ""
+
+
 def _iter_line_items(receipt: dict, source: str) -> Iterable[dict]:
     date = _receipt_date(receipt)
-    warehouse = receipt.get("warehouseName") or receipt.get("warehouseShortName") or ""
+    warehouse = warehouse_name(receipt)
     receipt_id = receipt.get("transactionBarcode") or ""
     doc_type = receipt.get("documentType") or receipt.get("transactionType") or ""
     otype = order_type(receipt)
-    for it in receipt.get("itemArray") or []:
-        desc = " ".join(
-            x for x in (it.get("itemDescription01"), it.get("itemDescription02")) if x
-        ).strip()
-        # Per-line fuel flag so gas lines are excluded from product metadata.
+    items = receipt.get("itemArray") or []
+    for it in items:
+        desc = item_description(it)
+        # Per-line fuel flag so gas lines report gallons (not the bogus unit=1)
+        # and are excluded from product metadata.
         is_fuel = otype == "fuel" and _item_is_fuel(it)
-        yield {
+        base = {
             "date": date,
             "item_number": (it.get("itemNumber") or "").strip(),
-            "description": desc,
-            "unit_qty": _num(it.get("unit")),
+            "unit_qty": fuel_gallons(it) if is_fuel else _num(it.get("unit")),
             "unit_price": _num(it.get("itemUnitPriceAmount")),
             "amount": _num(it.get("amount")),
             "department": it.get("itemDepartmentNumber") or "",
             "tax_flag": it.get("taxFlag") or "",
             "warehouse": warehouse,
+            "warehouse_number": str(receipt.get("warehouseNumber") or "").strip(),
             "receipt_id": receipt_id,
             "doc_type": doc_type,
-            "order_type": "fuel" if is_fuel else otype,
             "source": source,
         }
+        ref = discount_ref(desc)
+        if ref is not None:
+            # A discount: label it with the item it applies to and record that
+            # item's number so the UI can nest it directly under that item.
+            pnum, pdesc = resolve_discount(ref, items)
+            yield {**base,
+                   "description": f"Discount → {pdesc}" if pdesc else f"Discount → {ref}",
+                   "tax_exempt": "",
+                   "order_type": "discount",
+                   "discount_ref": pnum}
+            continue
+        tref = tax_ref(desc)
+        if tref is not None:
+            # An additional per-item tax (the inverse of a discount): keep its
+            # label, resolve the taxed item, and nest under it.
+            pref, label = tref
+            pnum, pdesc = resolve_discount(pref, items)
+            yield {**base,
+                   "description": f"{label} → {pdesc}" if pdesc else f"{label} → {pref}",
+                   "tax_exempt": "",
+                   "order_type": "tax",
+                   "discount_ref": pnum}
+            continue
+        yield {**base,
+               "description": desc,
+               "tax_exempt": "Y" if is_tax_exempt(it) else "",
+               "order_type": "fuel" if is_fuel else otype,
+               "discount_ref": ""}
 
 
 def _receipt_key(r: dict) -> str:
@@ -106,99 +222,16 @@ def _load_receipts(raw_dir: Path) -> list[dict]:
     return list(by_key.values())
 
 
-def _harvest_line_items(capture_dir: Path) -> list[dict]:
-    """Best-effort extraction of online-order line items from captured JSON."""
-    items: list[dict] = []
-    for f in sorted(capture_dir.glob("*.json")):
-        try:
-            blob = json.loads(f.read_text())
-        except Exception:
-            continue
-        _walk_for_items(blob.get("body", blob), items)
-    return items
-
-
-def _walk_for_items(node: Any, out: list[dict], date_hint: str = "") -> None:
-    """Recursively find dict nodes that look like an order line item."""
-    if isinstance(node, dict):
-        keys = {k.lower() for k in node.keys()}
-        looks_like_item = (
-            {"itemnumber", "itemdescription"} & keys
-            or {"sku", "quantity"} <= keys
-            or {"itemid", "unitprice"} <= keys
-        )
-        this_date = (
-            node.get("orderDate")
-            or node.get("orderPlacedDate")
-            or node.get("transactionDate")
-            or date_hint
-        )
-        if looks_like_item:
-            out.append(
-                {
-                    "date": str(this_date)[:10],
-                    "item_number": str(
-                        node.get("itemNumber") or node.get("sku") or node.get("itemId") or ""
-                    ).strip(),
-                    "description": str(
-                        node.get("itemDescription")
-                        or node.get("description")
-                        or node.get("name")
-                        or ""
-                    ).strip(),
-                    "unit_qty": _num(node.get("quantity") or node.get("unit")),
-                    "unit_price": _num(node.get("unitPrice") or node.get("price")),
-                    "amount": _num(
-                        node.get("amount") or node.get("lineTotal") or node.get("total")
-                    ),
-                    "department": "",
-                    "tax_flag": "",
-                    "warehouse": "ONLINE",
-                    "receipt_id": str(
-                        node.get("orderNumber") or node.get("orderId") or ""
-                    ),
-                    "doc_type": "online",
-                    "order_type": "online",
-                    "source": "online",
-                }
-            )
-        for v in node.values():
-            _walk_for_items(v, out, str(this_date)[:10])
-    elif isinstance(node, list):
-        for v in node:
-            _walk_for_items(v, out, date_hint)
-
-
 FIELDS = [
     "date", "item_number", "description", "unit_qty", "unit_price",
-    "amount", "department", "tax_flag", "warehouse", "receipt_id",
-    "doc_type", "order_type", "source",
+    "amount", "department", "tax_flag", "tax_exempt", "warehouse",
+    "warehouse_number", "receipt_id", "doc_type", "order_type",
+    "discount_ref", "source",
 ]
-
-
-def _dedup_online_items(items: list[dict]) -> list[dict]:
-    """Deduplicate ONLY online-order items.
-
-    The online path recursively walks arbitrary JSON, which can visit the same
-    line-item node via multiple paths and emit it more than once. We collapse
-    exact repeats there. We do NOT touch warehouse items: each entry in a
-    receipt's itemArray is a real scanned line, so two lines of the same SKU on
-    one receipt are two genuine purchases and are both kept.
-    """
-    seen: set[tuple] = set()
-    out = []
-    for it in items:
-        k = tuple(it[f] for f in FIELDS)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(it)
-    return out
 
 
 def parse_all(
     raw_dir: Path = config.RAW_DIR,
-    capture_dir: Path = config.CAPTURE_DIR,
     output_dir: Path = config.OUTPUT_DIR,
 ) -> dict:
     config.ensure_dirs()
@@ -210,8 +243,6 @@ def parse_all(
     line_items: list[dict] = []
     for r in receipts:
         line_items.extend(_iter_line_items(r, source="warehouse"))
-    # Online items: self-dedup only (JSON walk can revisit the same node).
-    line_items.extend(_dedup_online_items(_harvest_line_items(capture_dir)))
 
     # Sort newest first, then by receipt and item.
     line_items.sort(key=lambda x: (x["date"], x["receipt_id"], x["item_number"]), reverse=True)
@@ -268,7 +299,7 @@ def parse_all(
         rec_rows.append(
             {
                 "date": _receipt_date(r),
-                "warehouse": r.get("warehouseName") or r.get("warehouseShortName") or "",
+                "warehouse": warehouse_name(r),
                 "doc_type": r.get("documentType") or r.get("transactionType") or "",
                 "items": r.get("totalItemCount") or len(r.get("itemArray") or []),
                 "subtotal": _num(r.get("subTotal")),

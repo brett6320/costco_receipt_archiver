@@ -3,9 +3,8 @@
 Usage:
   python -m costco_archiver login      # open browser, sign in, cache creds
   python -m costco_archiver fetch      # download all warehouse/gas receipts
-  python -m costco_archiver online     # harvest online-order data (browser)
   python -m costco_archiver parse      # build deduplicated CSVs from raw data
-  python -m costco_archiver all        # login -> fetch -> online -> parse
+  python -m costco_archiver all        # login -> fetch -> parse
 """
 from __future__ import annotations
 
@@ -168,12 +167,8 @@ def cmd_import_curl(args) -> None:
     except CaptureError as ex:
         raise SystemExit(str(ex))
 
-    kind = result.get("kind", "warehouse")
     print(f"\n>>> Imported {result['headers']} headers from cURL"
-          + (f" + captured the {kind}-orders query." if result["has_query"] else "."))
-    if kind == "online":
-        print(">>> Online-orders request saved. Also capture the warehouse "
-              "'receiptsWithCounts' request for in-warehouse/gas receipts.")
+          + (" + captured the receipts query." if result["has_query"] else "."))
     print(f">>> Token valid ~{result['token_minutes']} more min.")
     if result["expired"]:
         print("!!! That token is ALREADY expired — recopy a fresh cURL and retry.")
@@ -182,7 +177,7 @@ def cmd_import_curl(args) -> None:
 
 
 def cmd_fetch(args) -> None:
-    from .fetch import fetch_all_receipts, fetch_online_orders
+    from .fetch import fetch_all_receipts
 
     creds = _load_or_login(timeout=args.timeout, channel=getattr(args, "channel", None))
     summary = fetch_all_receipts(
@@ -191,19 +186,7 @@ def cmd_fetch(args) -> None:
         max_empty_windows=args.max_empty,
         document_type=args.doc_type,
     )
-    # Also pull online orders if their request template was captured.
-    online = fetch_online_orders(creds, months_back=args.months_back)
-    summary["online"] = online
     print("\nFetch summary:")
-    print(json.dumps(summary, indent=2))
-
-
-def cmd_online(args) -> None:
-    from .harvest import harvest_online_orders
-
-    # Ensure we're logged in (persistent profile) before harvesting.
-    _load_or_login(timeout=args.timeout, channel=getattr(args, "channel", None))
-    summary = harvest_online_orders(scroll_rounds=args.scroll_rounds)
     print(json.dumps(summary, indent=2))
 
 
@@ -281,10 +264,83 @@ def cmd_refresh(args) -> None:
     print(json.dumps({"receipt": rid, "key": key, "markdown": md, "pdf": pdf}, indent=2))
 
 
+def _prompt_new_password(username: str) -> str:
+    import getpass
+    while True:
+        pw = getpass.getpass(f"New password for {username!r}: ")
+        if len(pw) < 8:
+            print("  Password must be at least 8 characters.")
+            continue
+        if pw != getpass.getpass("Confirm password: "):
+            print("  Passwords didn't match — try again.")
+            continue
+        return pw
+
+
+def _print_totp_enrollment(username: str, secret: str) -> None:
+    from .webauth import provisioning_uri
+    print("\nScan this in your authenticator app (Google Authenticator, 1Password, "
+          "Authy, …),\nor enter the secret manually:\n")
+    print(f"  Account : {config.AUTH_ISSUER}:{username}")
+    print(f"  Secret  : {secret}")
+    print(f"  otpauth : {provisioning_uri(username, secret)}\n")
+    print("Then sign in with your password + the 6-digit code it shows.")
+
+
+def cmd_auth_adduser(args) -> None:
+    from . import webauth
+    pw = _prompt_new_password(args.username)
+    try:
+        secret = webauth.add_user(args.username, pw)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"\n✓ Created user {args.username!r}.")
+    _print_totp_enrollment(args.username, secret)
+
+
+def cmd_auth_passwd(args) -> None:
+    from . import webauth
+    pw = _prompt_new_password(args.username)
+    try:
+        webauth.set_password(args.username, pw)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"✓ Password updated for {args.username!r}.")
+
+
+def cmd_auth_reset_mfa(args) -> None:
+    from . import webauth
+    try:
+        secret = webauth.reset_totp(args.username)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"✓ New TOTP secret for {args.username!r} (old codes no longer work).")
+    _print_totp_enrollment(args.username, secret)
+
+
+def cmd_auth_deluser(args) -> None:
+    from . import webauth
+    try:
+        webauth.delete_user(args.username)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"✓ Deleted user {args.username!r}.")
+
+
+def cmd_auth_users(args) -> None:
+    from . import webauth
+    users = webauth.list_users()
+    if not users:
+        print("No web accounts configured. Add one: "
+              "python -m costco_archiver auth adduser <name>")
+        return
+    print("Web accounts:")
+    for u in users:
+        print(f"  • {u}")
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
-    if not args.skip_online:
-        cmd_online(args)
     cmd_parse(args)
     if not getattr(args, "skip_pdf", False):
         cmd_pdf(args)
@@ -329,11 +385,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--doc-type", default="all")
     sp.set_defaults(func=cmd_fetch)
 
-    sp = sub.add_parser("online", help="harvest online-order data via browser")
-    add_common(sp)
-    sp.add_argument("--scroll-rounds", type=int, default=8)
-    sp.set_defaults(func=cmd_online)
-
     sp = sub.add_parser("parse", help="build deduplicated CSVs")
     add_common(sp)
     sp.set_defaults(func=cmd_parse)
@@ -346,7 +397,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_import)
 
     sp = sub.add_parser("pdf", help="render each receipt to a PDF archive (data/pdfs)")
-    sp.add_argument("--force", action="store_true", help="re-render existing PDFs")
+    sp.add_argument("--force", action="store_true",
+                    help="rewrite every PDF even if unchanged (default: only "
+                         "overwrite when the re-render differs)")
     sp.set_defaults(func=cmd_pdf)
 
     sp = sub.add_parser("web", help="launch the local receipt search UI")
@@ -355,6 +408,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--port", type=int, default=config.WEB_PORT,
                     help="bind port (env: COSTCO_WEB_PORT or PORT; default 8000)")
     sp.set_defaults(func=cmd_web)
+
+    sp = sub.add_parser("auth", help="manage web-UI accounts (password + TOTP MFA)")
+    asub = sp.add_subparsers(dest="auth_command", required=True)
+    a = asub.add_parser("adduser", help="create an account (prompts for password)")
+    a.add_argument("username")
+    a.set_defaults(func=cmd_auth_adduser)
+    a = asub.add_parser("passwd", help="change an account's password")
+    a.add_argument("username")
+    a.set_defaults(func=cmd_auth_passwd)
+    a = asub.add_parser("reset-mfa", help="regenerate an account's TOTP secret")
+    a.add_argument("username")
+    a.set_defaults(func=cmd_auth_reset_mfa)
+    a = asub.add_parser("deluser", help="delete an account")
+    a.add_argument("username")
+    a.set_defaults(func=cmd_auth_deluser)
+    a = asub.add_parser("users", help="list accounts")
+    a.set_defaults(func=cmd_auth_users)
 
     sp = sub.add_parser("markdown",
                         help="generate a Markdown archive (index + per-receipt pages)")
@@ -366,13 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-pdf", action="store_true", help="skip PDF re-render")
     sp.set_defaults(func=cmd_refresh)
 
-    sp = sub.add_parser("all", help="login -> fetch -> online -> parse -> pdf")
+    sp = sub.add_parser("all", help="login -> fetch -> parse -> pdf")
     add_common(sp)
     sp.add_argument("--months-back", type=int, default=36)
     sp.add_argument("--max-empty", type=int, default=6)
     sp.add_argument("--doc-type", default="all")
-    sp.add_argument("--scroll-rounds", type=int, default=8)
-    sp.add_argument("--skip-online", action="store_true")
     sp.add_argument("--skip-pdf", action="store_true")
     sp.set_defaults(func=cmd_all)
 

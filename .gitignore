@@ -6,10 +6,19 @@
 # api_request.json. Never commit any of it.
 data/
 
+# Generated receipt output, wherever it lands (belt-and-suspenders if the output
+# dir is relocated outside data/). No output is checked in: markdown, csv, json.
+output/
+**/output/
+*.csv
+receipts/*.md
+markdown/
+
 # Credentials / captured requests (belt-and-suspenders if data/ is relocated)
 **/credentials.json
 **/api_headers.json
 **/api_request.json
+**/web_users.json
 *.curl
 
 # All PDFs (receipt samples / exports contain member #, card digits) and any
@@ -23,3 +32,6 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# macOS
+.DS_Store

@@ -62,8 +62,8 @@ class FakeAPI:
 
 
 def run(tmp: Path):
-    raw = tmp / "raw"; cap = tmp / "cap"; out = tmp / "out"
-    for d in (raw, cap, out):
+    raw = tmp / "raw"; out = tmp / "out"
+    for d in (raw, out):
         d.mkdir(parents=True, exist_ok=True)
 
     # Isolate from any captured request template on the machine, so we test the
@@ -77,7 +77,7 @@ def run(tmp: Path):
     fetch_mod.fetch_all_receipts(creds, months_back=3, max_empty_windows=1, raw_dir=raw)
     fetch_mod.fetch_all_receipts(creds, months_back=3, max_empty_windows=1, raw_dir=raw)  # rerun
 
-    summary = parse_mod.parse_all(raw_dir=raw, capture_dir=cap, output_dir=out)
+    summary = parse_mod.parse_all(raw_dir=raw, output_dir=out)
     print(json.dumps(summary, indent=2))
 
     # Assertions

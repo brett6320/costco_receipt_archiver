@@ -16,6 +16,8 @@ from . import config
 
 # "9.99 N" / "371.70" / "38.77 Y" — amount with optional tax flag.
 _AMT = re.compile(r"^\s*([\d,]+\.\d{2})\s*([NYA])?\s*$")
+# "2 @ 11.99" — a quantity/unit-price line that PRECEDES its item on the receipt.
+_QTY = re.compile(r"^\s*(\d+)\s*@\s*([\d,]+\.\d{2})\s*$")
 _DATE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 _TIME = re.compile(r"\b(\d{2}):(\d{2})\b")
 _ITEMS_SOLD = re.compile(r"ITEMS?\s+SOLD\s*=\s*(\d+)", re.I)
@@ -89,23 +91,38 @@ def receipt_from_html(html_text: str) -> dict:
 
     items = []
     subtotal = taxes = total = 0.0
+    pending_qty = None  # a "N @ price" line seen just before its item
     for r in rows:
         cells = [c for c in r]
+        # Quantity line "N @ unit_price" (its own row, precedes the item).
+        if len(cells) == 1 and _QTY.match(cells[0]):
+            mq = _QTY.match(cells[0])
+            pending_qty = (int(mq.group(1)), _money(mq.group(2)))
+            continue
         # Item row: [flag, itemNumber, description, "amount [flag]"]
         if len(cells) == 4 and cells[1].isdigit() and _AMT.match(cells[3]):
             m = _AMT.match(cells[3])
+            amt = _money(m.group(1))
+            unit, unit_price = 1, amt
+            if pending_qty:  # apply only when qty × unit price matches the total
+                q, up = pending_qty
+                if q and abs(q * up - amt) < 0.01:
+                    unit, unit_price = q, up
+            pending_qty = None
             items.append({
                 "itemNumber": cells[1],
                 "itemDescription01": cells[2],
                 "itemDescription02": "",
-                "unit": 1,
-                "itemUnitPriceAmount": _money(m.group(1)),
-                "amount": _money(m.group(1)),
+                "unit": unit,
+                "itemUnitPriceAmount": unit_price,
+                "amount": amt,
                 "taxFlag": (m.group(2) or ""),
-                "entryMethod": cells[0],
+                # The leading 'E' is the tax-exempt marker (API's itemIdentifier).
+                "itemIdentifier": cells[0].strip(),
                 "itemDepartmentNumber": "",
             })
             continue
+        pending_qty = None  # any other row breaks the qty→item adjacency
         joined = " ".join(cells).upper()
         last_amt = next((c for c in reversed(cells) if _AMT.match(c)), None)
         if last_amt is None:
@@ -188,17 +205,28 @@ def _receipt_from_text(text: str) -> dict:
     tail = re.compile(r"^(.*?)([\d,]+\.\d{2})\s*([NYA])?$")
     pending = None
     started = False  # only collect items between the Member line and SUBTOTAL
+    pending_qty = [None]  # a "N @ price" line seen just before its item
 
     def _new_item(num, desc, entry):
+        # The leading 'E' is the tax-exempt marker (API's itemIdentifier).
         return {"itemNumber": num, "itemDescription01": desc.strip(),
                 "itemDescription02": "", "unit": 1, "amount": 0.0,
                 "itemUnitPriceAmount": 0.0, "taxFlag": "",
-                "entryMethod": "E" if entry else "", "itemDepartmentNumber": ""}
+                "itemIdentifier": "E" if entry else "", "itemDepartmentNumber": ""}
 
     def _complete(item, desc_extra, amt, flag):
         if desc_extra:
             item["itemDescription01"] = (item["itemDescription01"] + " " + desc_extra).strip()
-        item["amount"] = item["itemUnitPriceAmount"] = _money(amt)
+        a = _money(amt)
+        unit, unit_price = 1, a
+        if pending_qty[0]:  # apply only when qty × unit price matches the total
+            q, up = pending_qty[0]
+            if q and abs(q * up - a) < 0.01:
+                unit, unit_price = q, up
+        pending_qty[0] = None
+        item["amount"] = a
+        item["unit"] = unit
+        item["itemUnitPriceAmount"] = unit_price
         item["taxFlag"] = flag or ""
         items.append(item)
 
@@ -207,6 +235,10 @@ def _receipt_from_text(text: str) -> dict:
         if not started:
             if re.match(r"^MEMBER\b", u):
                 started = True
+            continue
+        if _QTY.match(ln):  # quantity line precedes its item
+            mq = _QTY.match(ln)
+            pending_qty[0] = (int(mq.group(1)), _money(mq.group(2)))
             continue
         if u.startswith("SUBTOTAL"):
             m = tail.match(ln)
@@ -281,29 +313,23 @@ def save_receipt(receipt: dict, raw_dir: Path = config.RAW_DIR) -> Path:
 
 def _ingest_json_file(f: Path, raw_dir: Path) -> int:
     """A .json export (API response, or array/obj of receipts). Extracts every
-    receipt-like object AND any online orders (getOnlineOrders/bcOrders) and
-    saves each — the bulk path used by the browser-console snippet."""
+    receipt-like object and saves each — the bulk path used by the
+    browser-console snippet."""
     import json
-    from .api import find_receipts, find_online_orders
+    from .api import find_receipts
     blob = json.loads(f.read_text())
     receipts = find_receipts(blob)
     if not receipts and isinstance(blob, dict) and blob.get("itemArray"):
         receipts = [blob]
-    online = find_online_orders(blob)  # bcOrders -> normalized receipts
-    saved, online_saved = 0, 0
+    saved = 0
     for rec in receipts:
         if not rec.get("itemArray"):
             continue
         rec.setdefault("source", "json-import")
         save_receipt(rec, raw_dir)
         saved += 1
-    for rec in online:
-        # keep online keys distinct from warehouse to avoid collisions
-        out = raw_dir / f"online_{_safe_name(rec)}.json"
-        out.write_text(json.dumps(rec, indent=2))
-        online_saved += 1
-    print(f"  {f.name} → {saved} receipt(s), {online_saved} online order(s)")
-    return saved + online_saved
+    print(f"  {f.name} → {saved} receipt(s)")
+    return saved
 
 
 def ingest_paths(paths: list[Path], raw_dir: Path = config.RAW_DIR) -> dict:

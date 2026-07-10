@@ -70,54 +70,16 @@
   const receipts = Object.values(all);
   console.log(`Warehouse/gas receipts: ${receipts.length}`);
 
-  // ---- Online (Costco.com) orders ----
-  // Separate query; warehouseNumber 847 is Costco's national e-commerce number.
-  const ONLINE_WAREHOUSE = '847';
-  const onlineQuery = `query getOnlineOrders($startDate:String!,$endDate:String!,$pageNumber:Int,$pageSize:Int,$warehouseNumber:String!){
-    getOnlineOrders(startDate:$startDate,endDate:$endDate,pageNumber:$pageNumber,pageSize:$pageSize,warehouseNumber:$warehouseNumber){
-      pageNumber pageSize totalNumberOfRecords
-      bcOrders{ orderHeaderId orderPlacedDate:orderedDate orderNumber:sourceOrderNumber orderTotal warehouseNumber status
-        orderLineItems{ itemId itemNumber lineNumber itemDescription deliveryDate status } } } }`;
-  const onlineResponses = [];
-  for (let y = now.getFullYear(); y >= START_YEAR; y--) {
-    let page = 1, total = null;
-    while (page <= 200) {
-      try {
-        const resp = await fetch(API, {
-          method: 'POST', headers, credentials: 'include',
-          body: JSON.stringify({ query: onlineQuery, variables: {
-            startDate: `${y}-01-01`, endDate: `${y}-12-31`,
-            pageNumber: page, pageSize: 25, warehouseNumber: ONLINE_WAREHOUSE } }),
-        });
-        if (!resp.ok) { console.warn('online', y, 'HTTP', resp.status); break; }
-        const j = await resp.json();
-        if (j.errors) { console.warn('online', y, 'errors', j.errors); break; }
-        const go = ((j.data || {}).getOnlineOrders || [])[0] || {};
-        const orders = go.bcOrders || [];
-        total = go.totalNumberOfRecords ?? total;
-        if (!orders.length) break;
-        onlineResponses.push(j);
-        console.log(`online ${y} p${page}: ${orders.length} orders`);
-        if (total != null && page * 25 >= total) break;
-        page++;
-      } catch (err) { console.error('online', y, err); break; }
-      await new Promise(res => setTimeout(res, 400));
-    }
-  }
-  const onlineCount = onlineResponses.reduce((n, j) =>
-    n + ((((j.data || {}).getOnlineOrders || [])[0] || {}).bcOrders || []).length, 0);
-  console.log(`Online orders: ${onlineCount}`);
-
-  if (!receipts.length && !onlineCount) {
+  if (!receipts.length) {
     console.error('Nothing returned. Share any GraphQL error above and we can adjust.');
     return;
   }
-  // Combined download — `import` extracts both warehouse receipts and online orders.
-  const out = { receipts, onlineOrders: onlineResponses };
+  // `import` extracts warehouse/gas receipts from this download.
+  const out = { receipts };
   const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'costco_receipts.json';
   document.body.appendChild(a); a.click(); a.remove();
-  console.log(`Downloaded costco_receipts.json (${receipts.length} receipts, ${onlineCount} online orders).`);
+  console.log(`Downloaded costco_receipts.json (${receipts.length} receipts).`);
 })();

@@ -1,8 +1,8 @@
 # Costco Receipt Archiver
 
 Logs into Costco.com in a real browser you control, downloads **all available
-warehouse & gas receipts** (and best-effort online-order data), and compiles
-every purchased item into **deduplicated CSVs** — by date, price, and item number.
+warehouse & gas receipts**, and compiles every purchased item into
+**deduplicated CSVs** — by date, price, and item number.
 
 It walks history **most-recent-first, backward in time**, and is **idempotent**:
 each receipt is saved once (keyed by its transaction barcode), so re-running only
@@ -21,9 +21,7 @@ picks up what's new and never double-counts.
    These authorize the receipts API. Nothing is sent anywhere but Costco.
 3. **Fetch** — queries the receipts GraphQL endpoint in monthly windows going
    backward, saving each receipt's raw JSON to `data/raw/`.
-4. **Online orders** — drives the logged-in browser through the "Orders &
-   Purchases" pages and captures the JSON the site loads (`data/captured/`).
-5. **Parse** — reads all raw data, dedupes, and writes CSVs to `data/output/`.
+4. **Parse** — reads all raw data, dedupes, and writes CSVs to `data/output/`.
 
 ## Setup
 
@@ -36,8 +34,12 @@ python -m playwright install chromium
 Or just launch the web app (creates the venv on first run):
 
 ```bash
+python -m costco_archiver auth adduser <name>   # first: create a login (see Web login)
 ./run_web.sh              # http://127.0.0.1:8000  (PORT=9000 ./run_web.sh to change)
 ```
+
+The web UI requires a login — create an account first, or the sign-in page will
+reject everyone. See [Web login](#web-login-authentication--mfa).
 
 ### Docker
 
@@ -46,29 +48,104 @@ docker compose up --build       # http://localhost:8000
 PORT=9000 docker compose up --build   # or any port
 ```
 
+Create a login before you sign in (the container serves the same auth-gated UI):
+
+```bash
+docker compose run --rm web python -m costco_archiver auth adduser <name>
+```
+
 The web port is configurable everywhere: `web --port 9000`, or the
 `COSTCO_WEB_PORT` (or generic `PORT`) env var, honored by the CLI, `run_web.sh`,
-and Docker/compose. `--port` overrides the env var.
+and Docker/compose. `--port` overrides the env var. The bind host defaults to
+`127.0.0.1` (`COSTCO_WEB_HOST`, or `web --host`); the Docker image binds
+`0.0.0.0` so the container is reachable from the host.
 
 The image bundles headless Chromium (for PDF rendering). Your data (receipts,
-CSVs, PDFs, Markdown, credentials) persists in `./data` via a mounted volume.
-The **Collect** tab works the same in Docker — you paste a *Copy as cURL* from
-your own browser; nothing is automated inside the container.
+CSVs, PDFs, Markdown, credentials, and the `web_users.json` account store)
+persists in `./data` via a mounted volume. The **Collect** tab works the same in
+Docker — you paste a *Copy as cURL* from your own browser; nothing is automated
+inside the container.
 
 ### Web app
 
 Open the app and you land on **Search**. The UI is **mobile-friendly** and has a
 **theme selector** (System / Light / **dark-gold** Dark). Two tabs:
 
-- **Search** — free-text + date/price/item-number/**type**/warehouse filters;
-  sortable columns; **Group by item #**; a colored left band per order (so items
-  from the same receipt are visually bracketed); a **F/W/O** letter badge per row
-  for transaction type (Fuel / Warehouse / Online); item numbers link to a Costco
-  product search (excluded for fuel); a **Refresh data** button to rebuild all
-  outputs from receipts on disk; and a per-row **↻** to refresh a single
-  receipt's PDF/barcode/Markdown (CLI: `refresh <receipt_id>`).
+- **Search** — free-text + date/price/item-number/**type**/**tax**/warehouse filters
+  (the Tax filter selects Taxable / Non-taxable / Tax-exempt) plus a **Has discount**
+  toggle (only items that carry a discount); sortable columns; **Group by item #**;
+  a colored left band per order (so items from the same receipt are visually
+  bracketed); a **F/W/D/T** letter badge per row for transaction type (Fuel /
+  Warehouse / **Discount** / **Tax**); a **Tax** column showing Costco's per-line
+  tax code (Y / N / numeric category codes) with a hover tooltip explaining it, and
+  an **E** chip on tax-exempt items; item numbers link to a Costco product search
+  (excluded for fuel/discount/tax);
+  per-row **＋ / −** buttons to include / exclude that order, item number,
+  description, or **store number** (they append editable tokens to the search box,
+  e.g. `item:1610256`, `-store:358`); a **Refresh data** button to rebuild all
+  outputs from receipts on disk; and a per-row **↻** to refresh a single receipt's
+  PDF/barcode/Markdown (CLI: `refresh <receipt_id>`).
+- **Summary stats & export** — **Matches**, **Total** (net spend), and **Discounts**
+  (total savings) update with the filters; **⬇ Export** downloads the current view
+  as a CSV (opens in Excel).
+- **Price history** — click a price (**Unit $**, or **Last $** in grouped mode) to
+  pop up a modal charting that item's price over time, with its average, low/high,
+  purchase count, and how the clicked price compares to the average.
+- **Orders collapse** — each transaction can collapse (click its start-of-order
+  block icon) to a one-line summary showing the item count and order total; a
+  **Collapse orders** toggle does all at once.
+- **Discounts** — Costco's per-item discounts (which print as `/<item #>`) are
+  labeled with the item they apply to (e.g. *Discount → LIVSFVARIETY VPACK*),
+  typed **D**, and nested directly beneath that item. The discount amount shows in
+  the **Unit $** column and the item's net price (total less discount) in **Amount**.
+  Discounts reduce **Total** (never added positively) and are also summed in the
+  **Discounts** stat; the collapsed item count excludes them.
+- **Additional taxes** — per-item surcharges (which print as `T/<item #>`, e.g. a
+  *liquor liter tax*) are the inverse of a discount: labeled with the taxed item,
+  typed **T**, nested beneath it, with the surcharge in **Unit $** and the item
+  total **plus** the tax in **Amount**. Like discounts they aren't counted as items.
+- **Fuel** — gas lines show the **grade** (e.g. Regular), **gallons** (derived from
+  total ÷ price, since the API omits the quantity), and **price per gallon**
+  (3 decimals) in the Qty / Unit $ columns.
 - **Collect** — capture credentials (paste a *Copy as cURL*) and run a collection
   back N months (default **36**) with a live progress bar and streaming log.
+
+### Web login (authentication + MFA)
+
+The web UI is **private**: every page and API route requires a signed-in session.
+Accounts are **local**, and login is **password + a TOTP one-time code** (the
+6-digit codes from Google Authenticator, 1Password, Authy, etc.). There's no open
+access — if no account exists, the login page refuses everyone.
+
+Manage accounts from the CLI (secrets are shown in your terminal, not the browser):
+
+```bash
+python -m costco_archiver auth adduser <name>   # prompts for a password, prints the TOTP secret
+python -m costco_archiver auth users            # list accounts
+python -m costco_archiver auth passwd <name>    # change password
+python -m costco_archiver auth reset-mfa <name> # regenerate the TOTP secret
+python -m costco_archiver auth deluser <name>   # remove an account
+```
+
+`adduser` prints an `otpauth://` URI and a base32 secret — scan/paste it into your
+authenticator, then sign in with your password + the current code. Accounts live in
+`data/web_users.json` (git-ignored, `0600`; passwords are salted **PBKDF2-HMAC-SHA256**,
+never stored in plaintext).
+
+Relevant environment variables:
+
+- `COSTCO_SESSION_TTL` — session lifetime in seconds (default `43200` = 12h).
+- `COSTCO_WEB_HTTPS=1` — mark the session cookie `Secure` when serving over TLS
+  (directly or behind a reverse proxy).
+- `COSTCO_AUTH_ISSUER` — label shown in authenticator apps (default
+  "Costco Receipt Archiver").
+
+> **Passkeys (WebAuthn) are planned but not yet implemented** — verifying them
+> securely needs crypto that isn't in the stdlib, so MFA is TOTP for now. Each
+> account already reserves a `passkeys` slot, so adding them later needs no data
+> migration. Note WebAuthn will require HTTPS (or `localhost`) and a fixed domain.
+
+> Sessions are held in server memory, so restarting `web` signs everyone out.
 
 ## 🛡️ Costco blocks automated logins (Kasada/Akamai) — use `import-curl`
 
@@ -93,18 +170,6 @@ often won't get through.
 browser used, so the API accepts them — **and** the request's GraphQL query/body,
 so `fetch` replays Costco's *own* query across date windows (no reliance on a
 hard-coded query that could drift). Do steps 3–4 promptly — see below.
-
-### Online (Costco.com) orders
-
-In-warehouse/gas receipts and **online orders** are two different Costco queries
-(`receiptsWithCounts` vs `getOnlineOrders`). To include online orders, capture
-**both** requests: on the receipts page grab the `receiptsWithCounts` request,
-and on **Orders & Purchases → Online** grab the `getOnlineOrders` request (each
-via *Copy as cURL* → `import-curl`; the tool auto-routes them). Then `fetch`
-pulls both. Online line items carry item number + description but **no per-item
-price** from Costco — single-item orders show the order total on the line;
-multi-item orders keep the total on the order (line amounts blank). Online rows
-are tagged **O** in the search UI.
 
 > The automated `login` command still exists and may work if you don't have
 > passkeys / aren't being throttled, but `import-curl` is what to reach for when
@@ -166,19 +231,23 @@ subtotal/tax/total, so you'll know if anything was missed.
 ## Web app: capture, collect, and search in one place
 
 ```bash
-python -m costco_archiver web            # then open http://127.0.0.1:8000
+python -m costco_archiver auth adduser <name>   # one-time: create a login
+python -m costco_archiver web                    # then open http://127.0.0.1:8000
 ```
 
-Two tabs:
+Sign in with your password + authenticator code (see
+[Web login](#web-login-authentication--mfa)), then use the two tabs:
 
 - **Collect** — on-screen instructions to grab a DevTools *Copy as cURL* of the
   receipts request, a box to paste it (**Capture**), then **Start collection**
   (default **36 months**, newest first) with a live progress bar and streaming
   log as it fetches, parses, renders PDFs, and builds Markdown.
-- **Search** — free-text search across description / item # / warehouse, plus
-  date-range, price-range, item-number and warehouse filters; sortable columns; a
-  **Group by item #** mode (times purchased, total spent, last price, first/last
-  date); and a link from each row to its rendered PDF.
+- **Search** — free-text (with `item:` / `store:` / `rcpt:` tokens and a leading
+  `-` to exclude) plus date / price / item-number / type / tax / warehouse filters
+  and a **Has discount** toggle; sortable columns; a **Group by item #** mode;
+  per-row **＋ / −** include/exclude buttons; live **Matches / Total / Discounts**
+  stats and **⬇ Export** to CSV; and per-receipt PDF links. See
+  [Web app](#web-app) for the full feature list.
 
 The same capture logic is available on the CLI as `import-curl`; everything the
 web app does maps to CLI commands, so both are maintained.
@@ -187,15 +256,11 @@ web app does maps to CLI commands, so both are maintained.
 
 ```bash
 # Recommended: login + fetch + parse + pdf in one shot (no stale-token gap)
-python -m costco_archiver all --skip-online
-
-# Do everything incl. online-order harvest
 python -m costco_archiver all
 
 # …or step by step:
 python -m costco_archiver login          # sign in once, cache the session
 python -m costco_archiver fetch          # download all warehouse/gas receipts
-python -m costco_archiver online         # harvest online-order data (browser)
 python -m costco_archiver parse          # (re)build the CSVs from raw data
 ```
 
@@ -203,14 +268,13 @@ Useful flags:
 
 - `--months-back N`   how far back to walk (default 36).
 - `--max-empty N`     stop after N consecutive empty months (default 6).
-- `--skip-online`     for `all`, skip the online-order harvest.
 - `--timeout SEC`     how long to wait for interactive login (default 300).
 
 ## Outputs (`data/output/`)
 
 | File | Contents |
 |------|----------|
-| `line_items.csv` | Every purchased line item, one row each, **newest first**: date, item number, description, qty, unit price, amount, warehouse, receipt id, source. |
+| `line_items.csv` | Every purchased line item, one row each, **newest first**: date, item number, description, qty (gallons for fuel), unit price (price/gal for fuel), amount, department, tax flag, `tax_exempt` (Y for the receipt's far-left "E" items), `warehouse` (name) and `warehouse_number` (atomic, as distinct columns), receipt id, doc type, `order_type` (warehouse/fuel/**discount**/**tax**), `discount_ref` (for discount & additional-tax lines, the item number they apply to), source. |
 | `items_deduped.csv` | **One row per item number**, aggregated across all purchases: times purchased, total qty, total spent, last price, first/last purchase date. |
 | `receipts.csv` | One row per receipt: date, warehouse, totals, taxes, instant savings. |
 
@@ -220,16 +284,20 @@ A browsable **Markdown archive** is written to `data/output/markdown/`:
 search/detail link for the item, masked member number, totals, and a link to the
 rendered PDF.
 
-Raw archives are kept in `data/raw/` (per-receipt JSON) and `data/captured/`
-(online-order network captures) so you can re-parse without re-downloading.
-Rendered per-receipt PDFs (plus any real PDFs the site served) live in
-`data/pdfs/`.
+Raw archives are kept in `data/raw/` (per-receipt JSON) so you can re-parse
+without re-downloading. Rendered per-receipt PDFs live in `data/pdfs/`. Re-running
+`pdf` always re-renders from the current template and **overwrites a PDF only when
+the result differs** (content or template change); unchanged files are left
+untouched. Pass `pdf --force` to rewrite every PDF regardless.
 
 ## Privacy
 
 - `data/` and `.costco_profile/` are git-ignored. The profile holds your logged-in
   session and the cached `data/credentials.json` holds bearer tokens — **keep them
   private** and don't commit them.
+- The web UI requires login (password + TOTP MFA); accounts live in the git-ignored
+  `data/web_users.json` (`0600`, salted PBKDF2 password hashes). See
+  [Web login](#web-login-authentication--mfa).
 
 ## Troubleshooting
 
@@ -277,14 +345,15 @@ Fixes, in order of reliability:
   export COSTCO_RECEIPTS_QUERY='query receiptsWithCounts($startDate:String!,$endDate:String!,$documentType:String!){ ... }'
   ```
   (Grab the current query from the site's own network request.)
-- **Online orders came back empty.** The SPA endpoints move around; the captures in
-  `data/captured/` are raw — inspect them and adjust `harvest.py`'s page list.
 
 ## Tests
 
 ```bash
-PYTHONPATH=. python tests/test_pipeline.py
+PYTHONPATH=. python tests/test_pipeline.py   # full fetch→parse pipeline (mocked API)
+PYTHONPATH=. python tests/test_dedup.py      # receipt/line-item dedup rules
+PYTHONPATH=. python tests/test_ingest.py     # HTML/PDF/JSON import path
 ```
 
-Runs the full fetch→parse pipeline against a mocked API (no network/login) and
-asserts dedup, aggregation, and newest-first ordering.
+`test_pipeline` runs the full fetch→parse pipeline against a mocked API (no
+network/login) and asserts dedup, aggregation, and newest-first ordering;
+`test_dedup` and `test_ingest` cover the dedup rules and the API-free import path.
