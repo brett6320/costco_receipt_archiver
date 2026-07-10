@@ -91,12 +91,20 @@ def save_from_curl(text: str) -> dict:
                     "client_identifier": config.CLIENT_IDENTIFIER}, indent=2))
 
     has_query = False
+    kind = "warehouse"
     if data and url:
         try:
             body = json.loads(data)
-            config.API_REQUEST_FILE.write_text(
-                json.dumps({"url": url, "body": body}, indent=2))
             has_query = isinstance(body, dict)
+            # Route to the right template file by which query it is.
+            query_text = str(body.get("query", "")) if has_query else ""
+            if "getOnlineOrders" in query_text:
+                kind = "online"
+                target = config.API_REQUEST_ONLINE_FILE
+            else:
+                kind = "warehouse"
+                target = config.API_REQUEST_FILE
+            target.write_text(json.dumps({"url": url, "body": body}, indent=2))
         except ValueError:
             config.API_REQUEST_FILE.write_text(
                 json.dumps({"url": url, "raw_body": data}, indent=2))
@@ -110,6 +118,7 @@ def save_from_curl(text: str) -> dict:
         "ok": True,
         "headers": len(headers),
         "has_query": has_query,
+        "kind": kind,
         "token_minutes": minutes,
         "expired": token_is_expired(token),
         "url": url,

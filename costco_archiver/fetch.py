@@ -16,20 +16,83 @@ from typing import Optional
 from dateutil.relativedelta import relativedelta
 
 from . import config
-from .api import CostcoAPI, CostcoAPIError, find_receipts, override_date_vars
+from .api import (CostcoAPI, CostcoAPIError, find_receipts, find_online_orders,
+                 override_date_vars)
 from .auth import Credentials
+
+
+def _load_template(path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        tpl = json.loads(path.read_text())
+    except Exception:
+        return None
+    return tpl if isinstance(tpl.get("body"), dict) else None
 
 
 def _load_request_template() -> dict | None:
     """The exact receipts request captured by `import-curl`, if any."""
-    f = config.API_REQUEST_FILE
-    if not f.exists():
-        return None
-    try:
-        tpl = json.loads(f.read_text())
-    except Exception:
-        return None
-    return tpl if isinstance(tpl.get("body"), dict) else None
+    return _load_template(config.API_REQUEST_FILE)
+
+
+def fetch_online_orders(
+    creds: Credentials, months_back: int = 36,
+    raw_dir: Path = config.RAW_DIR, progress_cb=None,
+) -> dict:
+    """Fetch Costco.com online orders by replaying the captured getOnlineOrders
+    request across pages. Requires an online template (import-curl of the
+    Orders & Purchases → Online request). Saves each order as a raw receipt."""
+    tpl = _load_template(config.API_REQUEST_ONLINE_FILE)
+    if not tpl:
+        return {"skipped": True, "reason": "no online-orders request captured"}
+    config.ensure_dirs()
+    body0 = dict(tpl["body"])
+    url = tpl.get("url")
+    vars0 = dict(body0.get("variables") or {})
+    today = dt.date.today()
+    start = today - relativedelta(months=months_back)
+    vars0 = override_date_vars(vars0, start.isoformat(), today.isoformat())
+    page_size = int(vars0.get("pageSize") or 10)
+
+    seen = {f.stem for f in raw_dir.glob("*.json")}
+    saved, page, total = 0, 1, None
+    with CostcoAPI(creds) as api:
+        while page <= 500:  # safety cap
+            body = dict(body0)
+            v = dict(vars0)
+            v["pageNumber"] = page
+            body["variables"] = v
+            try:
+                resp = api.post(body, url=url)
+            except Exception as ex:
+                print(f"  ! online request failed (page {page}): {ex}")
+                break
+            data = (resp.get("data") or {}).get("getOnlineOrders")
+            if isinstance(data, list) and data:
+                total = data[0].get("totalNumberOfRecords", total)
+            orders = find_online_orders(resp)
+            if not orders:
+                break
+            for rec in orders:
+                key = "online_" + _safe_key(rec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                (raw_dir / f"{key}.json").write_text(json.dumps(rec, indent=2))
+                saved += 1
+            print(f"  online page {page}: {len(orders)} orders")
+            if progress_cb:
+                try:
+                    progress_cb(page, None, saved, f"online p{page}")
+                except Exception:
+                    pass
+            if total is not None and page * page_size >= total:
+                break
+            page += 1
+
+    summary = {"online_orders_saved": saved, "total_records": total}
+    return summary
 
 
 def _safe_key(receipt: dict) -> str:

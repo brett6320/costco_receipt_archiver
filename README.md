@@ -88,6 +88,18 @@ browser used, so the API accepts them — **and** the request's GraphQL query/bo
 so `fetch` replays Costco's *own* query across date windows (no reliance on a
 hard-coded query that could drift). Do steps 3–4 promptly — see below.
 
+### Online (Costco.com) orders
+
+In-warehouse/gas receipts and **online orders** are two different Costco queries
+(`receiptsWithCounts` vs `getOnlineOrders`). To include online orders, capture
+**both** requests: on the receipts page grab the `receiptsWithCounts` request,
+and on **Orders & Purchases → Online** grab the `getOnlineOrders` request (each
+via *Copy as cURL* → `import-curl`; the tool auto-routes them). Then `fetch`
+pulls both. Online line items carry item number + description but **no per-item
+price** from Costco — single-item orders show the order total on the line;
+multi-item orders keep the total on the order (line amounts blank). Online rows
+are tagged **O** in the search UI.
+
 > The automated `login` command still exists and may work if you don't have
 > passkeys / aren't being throttled, but `import-curl` is what to reach for when
 > you see 429s.

@@ -28,6 +28,10 @@ API_HEADERS_FILE = DATA_DIR / "api_headers.json"
 # windows instead of relying on a hard-coded query that may drift.
 API_REQUEST_FILE = DATA_DIR / "api_request.json"
 
+# Same, but for the ONLINE-orders query (getOnlineOrders) — a separate endpoint
+# shape from warehouse receipts, captured independently.
+API_REQUEST_ONLINE_FILE = DATA_DIR / "api_request_online.json"
+
 # Decoded token/clientid cache (short-lived; token ~15 min).
 CRED_CACHE_FILE = DATA_DIR / "credentials.json"
 

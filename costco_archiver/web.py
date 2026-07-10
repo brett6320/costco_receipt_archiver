@@ -69,6 +69,14 @@ def _run_collection(months_back: int, do_pdf: bool):
         summary = fetch_all_receipts(creds, months_back=months_back, progress_cb=cb)
         _log(f"Fetched {summary.get('receipts_saved_this_run', 0)} new; "
              f"{summary.get('total_receipts_on_disk', 0)} total on disk.")
+        # Online orders (if that request template was captured).
+        from .fetch import fetch_online_orders
+        online = fetch_online_orders(creds, months_back=months_back, progress_cb=cb)
+        if online.get("skipped"):
+            _log("No online-orders request captured — skipping online orders. "
+                 "(Capture the Orders & Purchases → Online graphql request too.)")
+        else:
+            _log(f"Online orders: {online.get('online_orders_saved', 0)} saved.")
         _set_job(state="parsing", message="Building CSVs, index & Markdown…")
         _log("Parsing → CSVs…")
         parse_all()
@@ -567,8 +575,9 @@ async function capture(){
     if(!r.ok){ msg.className="msg err"; msg.textContent = d.error || "Capture failed"; }
     else {
       msg.className = d.expired ? "msg err" : "msg ok";
+      const kindTxt = d.kind==="online" ? " (online-orders request)" : (d.kind==="warehouse" && d.has_query ? " (warehouse receipts request)" : "");
       msg.textContent = (d.expired ? "⚠ Token already expired — recopy a fresh cURL. " : "✓ Captured. ")
-        + `${d.headers} headers` + (d.has_query?", query captured":"") + `, token ~${d.token_minutes} min left.`;
+        + `${d.headers} headers` + (d.has_query?", query captured":"") + kindTxt + `, token ~${d.token_minutes} min left.`;
     }
   }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
   $("captureBtn").disabled = false;

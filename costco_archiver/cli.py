@@ -168,8 +168,12 @@ def cmd_import_curl(args) -> None:
     except CaptureError as ex:
         raise SystemExit(str(ex))
 
+    kind = result.get("kind", "warehouse")
     print(f"\n>>> Imported {result['headers']} headers from cURL"
-          + (" + captured the request query." if result["has_query"] else "."))
+          + (f" + captured the {kind}-orders query." if result["has_query"] else "."))
+    if kind == "online":
+        print(">>> Online-orders request saved. Also capture the warehouse "
+              "'receiptsWithCounts' request for in-warehouse/gas receipts.")
     print(f">>> Token valid ~{result['token_minutes']} more min.")
     if result["expired"]:
         print("!!! That token is ALREADY expired — recopy a fresh cURL and retry.")
@@ -178,7 +182,7 @@ def cmd_import_curl(args) -> None:
 
 
 def cmd_fetch(args) -> None:
-    from .fetch import fetch_all_receipts
+    from .fetch import fetch_all_receipts, fetch_online_orders
 
     creds = _load_or_login(timeout=args.timeout, channel=getattr(args, "channel", None))
     summary = fetch_all_receipts(
@@ -187,6 +191,9 @@ def cmd_fetch(args) -> None:
         max_empty_windows=args.max_empty,
         document_type=args.doc_type,
     )
+    # Also pull online orders if their request template was captured.
+    online = fetch_online_orders(creds, months_back=args.months_back)
+    summary["online"] = online
     print("\nFetch summary:")
     print(json.dumps(summary, indent=2))
 
