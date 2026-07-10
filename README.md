@@ -33,6 +33,37 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
+Or just launch the web app (creates the venv on first run):
+
+```bash
+./run_web.sh              # http://127.0.0.1:8000  (PORT=9000 ./run_web.sh to change)
+```
+
+### Docker
+
+```bash
+docker compose up --build       # http://localhost:8000
+```
+
+The image bundles headless Chromium (for PDF rendering). Your data (receipts,
+CSVs, PDFs, Markdown, credentials) persists in `./data` via a mounted volume.
+The **Collect** tab works the same in Docker — you paste a *Copy as cURL* from
+your own browser; nothing is automated inside the container.
+
+### Web app
+
+Open the app and you land on **Search**. The UI is **mobile-friendly** and has a
+**theme selector** (System / Light / **dark-gold** Dark). Two tabs:
+
+- **Search** — free-text + date/price/item-number/**type**/warehouse filters;
+  sortable columns; **Group by item #**; a colored left band per order (so items
+  from the same receipt are visually bracketed); a **F/W/O** letter badge per row
+  for transaction type (Fuel / Warehouse / Online); item numbers link to a Costco
+  product search (excluded for fuel); and a **Refresh data** button to rebuild
+  outputs from receipts on disk.
+- **Collect** — capture credentials (paste a *Copy as cURL*) and run a collection
+  back N months (default **36**) with a live progress bar and streaming log.
+
 ## 🛡️ Costco blocks automated logins (Kasada/Akamai) — use `import-curl`
 
 Costco's sign-in is protected by **Kasada + Akamai** bot detection, which

@@ -27,15 +27,43 @@ def _receipt_date(r: dict) -> str:
     return str(raw)[:10]  # YYYY-MM-DD
 
 
+def _item_is_fuel(it: dict) -> bool:
+    """A line item that represents fuel (gas pump), not a warehouse product."""
+    if any(it.get(k) for k in ("fuelGradeCode", "fuelUomCode", "fuelGradeDescription",
+                               "fuelUnitQuantity")):
+        return True
+    desc = " ".join(str(it.get(k) or "") for k in
+                     ("itemDescription01", "itemDescription02")).upper()
+    return any(w in desc for w in ("REGULAR GAS", "PREMIUM GAS", "UNLEAD",
+                                   "DIESEL", "FUEL", "GASOLINE"))
+
+
+def order_type(receipt: dict) -> str:
+    """Classify a receipt as 'online', 'fuel', or 'warehouse'."""
+    dt = str(receipt.get("documentType") or "").lower()
+    tt = str(receipt.get("transactionType") or "").lower()
+    wh = str(receipt.get("warehouseName") or receipt.get("warehouseShortName") or "").lower()
+    src = str(receipt.get("source") or "").lower()
+    if "online" in src or wh == "online" or "online" in dt:
+        return "online"
+    if ("gas" in dt or "fuel" in dt or "gas" in tt or "gas" in wh or "fuel" in wh
+            or any(_item_is_fuel(it) for it in receipt.get("itemArray") or [])):
+        return "fuel"
+    return "warehouse"
+
+
 def _iter_line_items(receipt: dict, source: str) -> Iterable[dict]:
     date = _receipt_date(receipt)
     warehouse = receipt.get("warehouseName") or receipt.get("warehouseShortName") or ""
     receipt_id = receipt.get("transactionBarcode") or ""
     doc_type = receipt.get("documentType") or receipt.get("transactionType") or ""
+    otype = order_type(receipt)
     for it in receipt.get("itemArray") or []:
         desc = " ".join(
             x for x in (it.get("itemDescription01"), it.get("itemDescription02")) if x
         ).strip()
+        # Per-line fuel flag so gas lines are excluded from product metadata.
+        is_fuel = otype == "fuel" and _item_is_fuel(it)
         yield {
             "date": date,
             "item_number": (it.get("itemNumber") or "").strip(),
@@ -48,6 +76,7 @@ def _iter_line_items(receipt: dict, source: str) -> Iterable[dict]:
             "warehouse": warehouse,
             "receipt_id": receipt_id,
             "doc_type": doc_type,
+            "order_type": "fuel" if is_fuel else otype,
             "source": source,
         }
 
@@ -129,6 +158,7 @@ def _walk_for_items(node: Any, out: list[dict], date_hint: str = "") -> None:
                         node.get("orderNumber") or node.get("orderId") or ""
                     ),
                     "doc_type": "online",
+                    "order_type": "online",
                     "source": "online",
                 }
             )
@@ -142,7 +172,7 @@ def _walk_for_items(node: Any, out: list[dict], date_hint: str = "") -> None:
 FIELDS = [
     "date", "item_number", "description", "unit_qty", "unit_price",
     "amount", "department", "tax_flag", "warehouse", "receipt_id",
-    "doc_type", "source",
+    "doc_type", "order_type", "source",
 ]
 
 

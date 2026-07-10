@@ -1,0 +1,10 @@
+services:
+  web:
+    build: .
+    image: costco-receipt-archiver
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist receipts, CSVs, PDFs, markdown, and credentials on the host.
+      - ./data:/app/data
+    restart: unless-stopped

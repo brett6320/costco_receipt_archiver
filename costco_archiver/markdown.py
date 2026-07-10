@@ -19,7 +19,9 @@ from urllib.parse import quote_plus
 
 from . import config
 from .barcode_util import barcode_svg
-from .parse import _load_receipts, _receipt_date, _num
+from .parse import _load_receipts, _receipt_date, _num, order_type, _item_is_fuel
+
+_TYPE_ICON = {"fuel": "⛽ Fuel", "online": "🌐 Online", "warehouse": "🏬 Warehouse"}
 
 _SEARCH = "https://www.costco.com/CatalogSearch?dept=All&keyword={}"
 
@@ -60,7 +62,9 @@ def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
     ]
     if barcode_href:
         lines += [f'<img src="{barcode_href}" alt="{barcode}" height="56">', ""]
+    otype = order_type(r)
     lines += [
+        f"- **Type:** {_TYPE_ICON.get(otype, otype)}",
         f"- **Date:** {r.get('transactionDateTime') or date}",
         f"- **Warehouse:** {warehouse}"
         + (f" (#{r.get('warehouseNumber')})" if r.get("warehouseNumber") else ""),
@@ -83,8 +87,9 @@ def _receipt_page(r: dict, barcode_href: str | None = None) -> str:
         qty = it.get("unit") or 1
         amount = _money(it.get("amount"))
         tax = it.get("taxFlag") or ""
-        lines.append(
-            f"| {num} | {desc} | {qty} | {amount} | {tax} | {_item_link(num, desc)} |")
+        # Exclude product-lookup metadata for gas/fuel line items.
+        detail = "" if (otype == "fuel" and _item_is_fuel(it)) else _item_link(num, desc)
+        lines.append(f"| {num} | {desc} | {qty} | {amount} | {tax} | {detail} |")
     lines += [
         "",
         f"| | | | |",

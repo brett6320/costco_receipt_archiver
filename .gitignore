@@ -1,8 +1,21 @@
 # Playwright persistent browser profile (contains your logged-in session!)
 .costco_profile/
 
-# Downloaded data
+# All generated/downloaded data: raw receipts, parsed CSVs, PDFs, markdown,
+# captures, fetch summaries — and credentials.json / api_headers.json /
+# api_request.json. Never commit any of it.
 data/
+
+# Credentials / captured requests (belt-and-suspenders if data/ is relocated)
+**/credentials.json
+**/api_headers.json
+**/api_request.json
+*.curl
+
+# All PDFs (receipt samples / exports contain member #, card digits) and any
+# exported receipt JSON.
+*.pdf
+costco_receipts*.json
 
 # Python
 __pycache__/
@@ -10,7 +23,3 @@ __pycache__/
 .venv/
 venv/
 .env
-
-# Personal receipt samples (contain member #, card digits)
-myaccount.pdf
-/*.pdf

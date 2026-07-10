@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.costco_profile
+data
+tests
+*.pdf
+myaccount.pdf
+costco_receipts*.json

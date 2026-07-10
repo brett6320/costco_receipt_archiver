@@ -88,7 +88,9 @@ def render_all_pdfs(
 
     rendered, skipped = 0, 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # --no-sandbox lets headless Chromium run as root inside Docker.
+        browser = p.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         page = browser.new_page()
         for f in files:
             out = pdf_dir / f"{f.stem}.pdf"
