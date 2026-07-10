@@ -43,7 +43,12 @@ Or just launch the web app (creates the venv on first run):
 
 ```bash
 docker compose up --build       # http://localhost:8000
+PORT=9000 docker compose up --build   # or any port
 ```
+
+The web port is configurable everywhere: `web --port 9000`, or the
+`COSTCO_WEB_PORT` (or generic `PORT`) env var, honored by the CLI, `run_web.sh`,
+and Docker/compose. `--port` overrides the env var.
 
 The image bundles headless Chromium (for PDF rendering). Your data (receipts,
 CSVs, PDFs, Markdown, credentials) persists in `./data` via a mounted volume.

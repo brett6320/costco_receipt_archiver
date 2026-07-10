@@ -47,6 +47,14 @@ CLIENT_IDENTIFIER = os.environ.get(
     "COSTCO_CLIENT_IDENTIFIER", "481b1aec-aa3b-454b-b81b-48187e28f205"
 )
 
+# Web server host/port. Configurable via env (COSTCO_WEB_HOST / COSTCO_WEB_PORT,
+# or the generic PORT). The `web --port/--host` flags override these.
+WEB_HOST = os.environ.get("COSTCO_WEB_HOST", "127.0.0.1")
+try:
+    WEB_PORT = int(os.environ.get("COSTCO_WEB_PORT") or os.environ.get("PORT") or 8000)
+except ValueError:
+    WEB_PORT = 8000
+
 # A modern desktop UA reduces the chance of being served a degraded/blocked page.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

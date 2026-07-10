@@ -18,7 +18,10 @@ COPY README.md ./
 
 # Receipts, outputs, credentials all live here — mount a volume to persist.
 VOLUME /app/data
-EXPOSE 8000
 
-# Bind to all interfaces so the container is reachable from the host.
-CMD ["python", "-m", "costco_archiver", "web", "--host", "0.0.0.0", "--port", "8000"]
+# Port is configurable via the PORT env var (default 8000).
+ENV PORT=8000
+EXPOSE ${PORT}
+
+# Shell form so $PORT is expanded; bind to all interfaces for host reachability.
+CMD python -m costco_archiver web --host 0.0.0.0 --port "${PORT}"

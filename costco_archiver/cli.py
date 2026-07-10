@@ -326,8 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_pdf)
 
     sp = sub.add_parser("web", help="launch the local receipt search UI")
-    sp.add_argument("--host", default="127.0.0.1")
-    sp.add_argument("--port", type=int, default=8000)
+    sp.add_argument("--host", default=config.WEB_HOST,
+                    help="bind host (env: COSTCO_WEB_HOST; default 127.0.0.1)")
+    sp.add_argument("--port", type=int, default=config.WEB_PORT,
+                    help="bind port (env: COSTCO_WEB_PORT or PORT; default 8000)")
     sp.set_defaults(func=cmd_web)
 
     sp = sub.add_parser("markdown",
