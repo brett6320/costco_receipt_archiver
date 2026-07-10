@@ -23,6 +23,11 @@ PDF_DIR = DATA_DIR / "pdfs"          # per-receipt PDF archive (+ captured PDFs)
 # Tokens live ~15 min, so this file is short-lived by nature.
 API_HEADERS_FILE = DATA_DIR / "api_headers.json"
 
+# Exact request (url + POST body) captured from the browser's receipts call, so
+# fetch can replay Costco's own GraphQL query/variables verbatim across date
+# windows instead of relying on a hard-coded query that may drift.
+API_REQUEST_FILE = DATA_DIR / "api_request.json"
+
 # Costco endpoints (undocumented; reverse-engineered from the site's own calls).
 GRAPHQL_URL = "https://ecom-api.costco.com/ebusiness/order/v1/orders/graphql"
 SIGNIN_URL = "https://www.costco.com/LogonForm"

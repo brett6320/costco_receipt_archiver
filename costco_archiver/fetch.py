@@ -16,8 +16,20 @@ from typing import Optional
 from dateutil.relativedelta import relativedelta
 
 from . import config
-from .api import CostcoAPI, CostcoAPIError
+from .api import CostcoAPI, CostcoAPIError, find_receipts, override_date_vars
 from .auth import Credentials
+
+
+def _load_request_template() -> dict | None:
+    """The exact receipts request captured by `import-curl`, if any."""
+    f = config.API_REQUEST_FILE
+    if not f.exists():
+        return None
+    try:
+        tpl = json.loads(f.read_text())
+    except Exception:
+        return None
+    return tpl if isinstance(tpl.get("body"), dict) else None
 
 
 def _safe_key(receipt: dict) -> str:
@@ -49,13 +61,24 @@ def fetch_all_receipts(
     for f in raw_dir.glob("*.json"):
         seen.add(f.stem)
 
+    template = _load_request_template()
+    if template:
+        print("  Using captured request template (Costco's own query).")
+
     with CostcoAPI(creds) as api:
         for _ in range(months_back):
             window_start = window_end - relativedelta(months=1) + dt.timedelta(days=1)
             s, e = window_start.isoformat(), window_end.isoformat()
             windows += 1
             try:
-                receipts = api.receipts(s, e, document_type=document_type)
+                if template:
+                    body = dict(template["body"])
+                    body["variables"] = override_date_vars(
+                        body.get("variables", {}), s, e)
+                    resp = api.post(body, url=template.get("url"))
+                    receipts = find_receipts(resp)
+                else:
+                    receipts = api.receipts(s, e, document_type=document_type)
             except CostcoAPIError as ex:
                 print(f"  ! GraphQL error for {s}..{e}: {ex.errors}")
                 receipts = []

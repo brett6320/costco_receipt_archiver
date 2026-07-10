@@ -252,9 +252,11 @@ def _receipt_from_text(text: str) -> dict:
     barcode = next((ln.strip() for ln in lines if _BARCODE.match(ln.strip())), "")
     wh = next((ln for ln in lines if re.search(r"#\s*\d+", ln)), "")
     mi = _ITEMS_SOLD.search(text)
+    mmem = re.search(r"MEMBER\s+(\d{6,})", text, re.I)
     return {
         "transactionBarcode": barcode, "transactionDateTime": dt_iso,
         "transactionDate": date_only, "warehouseName": wh, "warehouseShortName": wh,
+        "member": mmem.group(1) if mmem else "",
         "warehouseNumber": (re.search(r"#\s*(\d+)", wh) or [None, ""])[1] if wh else "",
         "documentType": "warehouse", "transactionType": "Sales",
         "subTotal": subtotal, "taxes": taxes, "total": total,

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 import json
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,14 +52,29 @@ def _iter_line_items(receipt: dict, source: str) -> Iterable[dict]:
         }
 
 
+def _receipt_key(r: dict) -> str:
+    """Identity of a receipt, so the SAME receipt ingested twice (e.g. via API
+    and via PDF/HTML import) is counted once — without merging distinct items."""
+    bc = (r.get("transactionBarcode") or "").strip()
+    if bc:
+        return bc
+    # No barcode: fall back to a composite so genuinely different receipts stay
+    # distinct while an identical re-ingest collapses.
+    return "|".join(str(r.get(k, "")) for k in (
+        "transactionDateTime", "warehouseNumber", "transactionType",
+        "total", "totalItemCount"))
+
+
 def _load_receipts(raw_dir: Path) -> list[dict]:
-    out = []
+    """Load raw receipts, deduplicated by receipt identity (barcode)."""
+    by_key: dict[str, dict] = {}
     for f in sorted(raw_dir.glob("*.json")):
         try:
-            out.append(json.loads(f.read_text()))
+            r = json.loads(f.read_text())
         except Exception:
             continue
-    return out
+        by_key.setdefault(_receipt_key(r), r)  # first wins; dupes ignored
+    return list(by_key.values())
 
 
 def _harvest_line_items(capture_dir: Path) -> list[dict]:
@@ -132,29 +146,24 @@ FIELDS = [
 ]
 
 
-def _dedup_line_items(items: list[dict]) -> list[dict]:
-    """Drop exact duplicate lines that can arise from overlapping captures.
+def _dedup_online_items(items: list[dict]) -> list[dict]:
+    """Deduplicate ONLY online-order items.
 
-    A physical line is identified by receipt + item + amount + qty. Two genuine
-    purchases of the same item on one receipt keep distinct positions via index.
+    The online path recursively walks arbitrary JSON, which can visit the same
+    line-item node via multiple paths and emit it more than once. We collapse
+    exact repeats there. We do NOT touch warehouse items: each entry in a
+    receipt's itemArray is a real scanned line, so two lines of the same SKU on
+    one receipt are two genuine purchases and are both kept.
     """
-    seen: dict[tuple, int] = defaultdict(int)
+    seen: set[tuple] = set()
     out = []
     for it in items:
-        base = (
-            it["receipt_id"], it["item_number"], it["date"],
-            it["amount"], it["unit_qty"], it["description"],
-        )
-        seen[base] += 1
-        # Keep occurrences up to how many times they appear within one source
-        # load; but across reruns receipt_id dedup already prevents inflation.
-        out.append(it)
-    # Collapse fully-identical rows (same base seen from re-parsing same file set)
-    unique = {}
-    for it in out:
         k = tuple(it[f] for f in FIELDS)
-        unique[k] = it
-    return list(unique.values())
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
 
 
 def parse_all(
@@ -165,11 +174,14 @@ def parse_all(
     config.ensure_dirs()
     receipts = _load_receipts(raw_dir)
 
+    # Warehouse items: every itemArray entry is a real scanned line — keep all.
+    # Receipt-level dedup (above) already prevents the same receipt counting
+    # twice, so identical SKU lines here are genuine repeat purchases.
     line_items: list[dict] = []
     for r in receipts:
         line_items.extend(_iter_line_items(r, source="warehouse"))
-    line_items.extend(_harvest_line_items(capture_dir))
-    line_items = _dedup_line_items(line_items)
+    # Online items: self-dedup only (JSON walk can revisit the same node).
+    line_items.extend(_dedup_online_items(_harvest_line_items(capture_dir)))
 
     # Sort newest first, then by receipt and item.
     line_items.sort(key=lambda x: (x["date"], x["receipt_id"], x["item_number"]), reverse=True)

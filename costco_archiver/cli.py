@@ -141,8 +141,8 @@ def cmd_paste_token(args) -> None:
     print("    python -m costco_archiver fetch && python -m costco_archiver parse")
 
 
-def _parse_curl(text: str) -> tuple[str, dict]:
-    """Parse a browser 'Copy as cURL' command into (url, headers).
+def _parse_curl(text: str) -> tuple[str, dict, str]:
+    """Parse a browser 'Copy as cURL' command into (url, headers, data).
 
     Handles bash ($'...') and cmd/PowerShell (^ line continuations) variants.
     """
@@ -156,7 +156,8 @@ def _parse_curl(text: str) -> tuple[str, dict]:
     except ValueError:
         tokens = shlex.split(t.replace("$'", "'"))
 
-    url, headers = "", {}
+    url, headers, data = "", {}, ""
+    data_flags = ("--data", "--data-raw", "--data-binary", "--data-ascii", "-d")
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -173,10 +174,14 @@ def _parse_curl(text: str) -> tuple[str, dict]:
             headers["cookie"] = tokens[i + 1]
             i += 2
             continue
+        if tok in data_flags and i + 1 < len(tokens):
+            data = tokens[i + 1]
+            i += 2
+            continue
         if tok.lower().startswith("http"):
             url = tok
         i += 1
-    return url, headers
+    return url, headers, data
 
 
 def cmd_import_curl(args) -> None:
@@ -202,7 +207,7 @@ def cmd_import_curl(args) -> None:
     if not text or "curl" not in text.lower():
         raise SystemExit("No cURL command found (clipboard empty? use --file <path>).")
 
-    url, headers = _parse_curl(text)
+    url, headers, data = _parse_curl(text)
     # Drop headers that break an httpx replay (auto-managed / HTTP-2 pseudo).
     _DROP = {"content-length", "accept-encoding", "host", "connection",
              "transfer-encoding"}
@@ -226,7 +231,21 @@ def cmd_import_curl(args) -> None:
     creds = Credentials(id_token=token, client_id=cid)
     CRED_CACHE.write_text(json.dumps(asdict(creds), indent=2))
 
-    print(f"\n>>> Imported {len(headers)} headers from cURL.")
+    # Save the exact request so fetch can replay Costco's real query verbatim.
+    req_saved = False
+    if data and url:
+        try:
+            body = json.loads(data)
+            config.API_REQUEST_FILE.write_text(
+                json.dumps({"url": url, "body": body}, indent=2))
+            req_saved = True
+        except ValueError:
+            config.API_REQUEST_FILE.write_text(
+                json.dumps({"url": url, "raw_body": data}, indent=2))
+            req_saved = True
+
+    print(f"\n>>> Imported {len(headers)} headers from cURL"
+          + (" + captured the request query." if req_saved else "."))
     exp = token_expiry(token)
     if exp:
         import datetime
@@ -304,6 +323,13 @@ def cmd_web(args) -> None:
     serve(host=args.host, port=args.port)
 
 
+def cmd_markdown(args) -> None:
+    from .markdown import generate_markdown
+
+    summary = generate_markdown()
+    print(json.dumps(summary, indent=2))
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
     if not args.skip_online:
@@ -311,6 +337,7 @@ def cmd_all(args) -> None:
     cmd_parse(args)
     if not getattr(args, "skip_pdf", False):
         cmd_pdf(args)
+    cmd_markdown(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -375,6 +402,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8000)
     sp.set_defaults(func=cmd_web)
+
+    sp = sub.add_parser("markdown",
+                        help="generate a Markdown archive (index + per-receipt pages)")
+    sp.set_defaults(func=cmd_markdown)
 
     sp = sub.add_parser("all", help="login -> fetch -> online -> parse -> pdf")
     add_common(sp)

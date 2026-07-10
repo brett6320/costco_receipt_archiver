@@ -105,6 +105,15 @@ class CostcoAPI:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def post(self, body: dict, url: str | None = None) -> dict:
+        """POST an arbitrary GraphQL body; return parsed JSON (raises on errors)."""
+        resp = self._client.post(url or config.GRAPHQL_URL, json=body)
+        resp.raise_for_status()
+        out = resp.json()
+        if out.get("errors"):
+            raise CostcoAPIError(out["errors"], out.get("data"))
+        return out
+
     def receipts(
         self, start_date: str, end_date: str, document_type: str = "all"
     ) -> list[dict[str, Any]]:
@@ -131,3 +140,41 @@ class CostcoAPIError(RuntimeError):
         self.errors = errors
         self.data = data
         super().__init__(f"GraphQL errors: {errors}")
+
+
+def find_receipts(obj: Any) -> list[dict]:
+    """Recursively find receipt-like dicts in an arbitrary GraphQL response.
+
+    A receipt looks like a dict with a barcode/transaction id and an itemArray.
+    Lets us consume Costco's real response shape without hard-coding the path.
+    """
+    found: list[dict] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "itemArray" in node and (
+                node.get("transactionBarcode")
+                or node.get("transactionDateTime")
+                or node.get("transactionDate")
+            ):
+                found.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return found
+
+
+def override_date_vars(variables: dict, start_date: str, end_date: str) -> dict:
+    """Return a copy of GraphQL variables with start/end date fields swapped."""
+    out = dict(variables or {})
+    for k in list(out.keys()):
+        kl = k.lower()
+        if "start" in kl and "date" in kl:
+            out[k] = start_date
+        elif "end" in kl and "date" in kl:
+            out[k] = end_date
+    return out

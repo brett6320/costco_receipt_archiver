@@ -53,7 +53,9 @@ often won't get through.
    ```
 
 `import-curl` captures the **exact** headers (fresh token, clientid, cookies) the
-browser used, so the API accepts them. Do steps 3–4 promptly — see below.
+browser used, so the API accepts them — **and** the request's GraphQL query/body,
+so `fetch` replays Costco's *own* query across date windows (no reliance on a
+hard-coded query that could drift). Do steps 3–4 promptly — see below.
 
 > The automated `login` command still exists and may work if you don't have
 > passkeys / aren't being throttled, but `import-curl` is what to reach for when
@@ -82,6 +84,7 @@ python -m costco_archiver import --clipboard                   # HTML on clipboa
 
 python -m costco_archiver parse    # build CSVs
 python -m costco_archiver pdf      # render a clean PDF archive of each receipt
+python -m costco_archiver markdown # index + per-receipt Markdown pages
 python -m costco_archiver web      # search UI at http://127.0.0.1:8000
 ```
 
@@ -131,6 +134,12 @@ Useful flags:
 | `line_items.csv` | Every purchased line item, one row each, **newest first**: date, item number, description, qty, unit price, amount, warehouse, receipt id, source. |
 | `items_deduped.csv` | **One row per item number**, aggregated across all purchases: times purchased, total qty, total spent, last price, first/last purchase date. |
 | `receipts.csv` | One row per receipt: date, warehouse, totals, taxes, instant savings. |
+
+A browsable **Markdown archive** is written to `data/output/markdown/`:
+`index.md` lists every purchase (receipt) in descending date order and links to
+`receipts/<id>.md`, a page per receipt with each line item, a Costco
+search/detail link for the item, masked member number, totals, and a link to the
+rendered PDF.
 
 Raw archives are kept in `data/raw/` (per-receipt JSON) and `data/captured/`
 (online-order network captures) so you can re-parse without re-downloading.
