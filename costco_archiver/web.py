@@ -110,6 +110,16 @@ def _run_collection(months_back: int, do_pdf: bool):
         summary = fetch_all_receipts(creds, months_back=months_back, progress_cb=cb)
         _log(f"Fetched {summary.get('receipts_saved_this_run', 0)} new; "
              f"{summary.get('total_receipts_on_disk', 0)} total on disk.")
+        # Auto-snapshot the imported data whenever a collection brought in new
+        # receipts, so every import is captured in a restorable backup.
+        if summary.get("receipts_saved_this_run", 0):
+            try:
+                from .backup import create_backup
+                b = create_backup(label="auto: after collection")
+                _log(f"Backed up {b['receipt_count']} receipts → {b['name']} "
+                     f"({b['size'] // 1024} KB).")
+            except Exception as ex:
+                _log(f"Backup skipped: {ex}")
         _set_job(state="parsing", message="Building CSVs, index & Markdown…")
         _log("Parsing → CSVs…")
         parse_all()
@@ -506,6 +516,25 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._send(200, json.dumps({"users": webauth.users_overview()}).encode())
+        elif path == "/api/backups":
+            # Admin-only: list compressed raw-data backups.
+            if not self._require_admin():
+                return
+            from . import backup
+            self._send(200, json.dumps({"backups": backup.list_backups()}).encode())
+        elif path.startswith("/backup/"):
+            # Admin-only: download a backup archive.
+            if not self._require_admin():
+                return
+            from . import backup
+            name = path[len("/backup/"):]
+            try:
+                data = backup.backup_bytes(name)
+            except Exception:
+                self._send(404, b'{"error":"backup not found"}')
+                return
+            self._send(200, data, "application/gzip", extra_headers=[
+                ("Content-Disposition", f'attachment; filename="{name}"')])
         elif path == "/api/reload":
             _Handler.rows = _load_rows()
             self._send(200, json.dumps({"reloaded": len(self.rows)}).encode())
@@ -560,6 +589,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/users"):
             self._handle_users_post(path)
+        elif path.startswith("/api/backups"):
+            self._handle_backups_post(path)
         elif path == "/api/capture":
             from .capture import save_from_curl, CaptureError
             body = self._read_json()
@@ -664,6 +695,40 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(404, b'{"error":"not found"}')
         except ValueError as ex:
             # Domain guards (duplicate user, unknown user, last-admin protection).
+            self._send(400, json.dumps({"error": str(ex)}).encode())
+        except Exception as ex:
+            self._send(500, json.dumps({"error": str(ex)}).encode())
+
+    # --- backup management (admin only) ---------------------------------------
+    def _handle_backups_post(self, path: str) -> None:
+        """Create / restore / delete compressed raw-data backups. Admin-only."""
+        if not self._require_admin():
+            return
+        from . import backup
+        body = self._read_json()
+        try:
+            if path == "/api/backups":  # create a new snapshot
+                result = backup.create_backup(label=str(body.get("label", "")))
+                self._send(200, json.dumps({"ok": True, **result}).encode())
+            elif path == "/api/backups/restore":
+                result = backup.restore_backup(str(body.get("name", "")).strip())
+                # Rebuild derived outputs (CSVs/Markdown/PDFs) from the now-larger
+                # raw set — but only if the restore actually added receipts, and
+                # only when no other job is mid-flight.
+                if result.get("restored"):
+                    snap = _job_snapshot()
+                    if snap["state"] not in ("running", "parsing", "rendering"):
+                        do_pdf = bool(body.get("render_pdf", True))
+                        threading.Thread(target=_run_reprocess, args=(do_pdf,),
+                                         daemon=True).start()
+                        result["reprocessing"] = True
+                self._send(200, json.dumps({"ok": True, **result}).encode())
+            elif path == "/api/backups/delete":
+                backup.delete_backup(str(body.get("name", "")).strip())
+                self._send(200, json.dumps({"ok": True}).encode())
+            else:
+                self._send(404, b'{"error":"not found"}')
+        except ValueError as ex:
             self._send(400, json.dumps({"error": str(ex)}).encode())
         except Exception as ex:
             self._send(500, json.dumps({"error": str(ex)}).encode())
@@ -974,6 +1039,23 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         <span class="msg" id="reprocessMsg"></span>
       </div>
     </div>
+
+    <div class="card">
+      <h2>4 · Backups</h2>
+      <p style="font-size:13px;color:var(--muted);margin:0 0 10px">
+        Compressed snapshots of your imported receipts (<code>data/raw</code>). A
+        backup is taken automatically after each collection that brings in new
+        receipts. <b>Restore never creates duplicates</b> — receipts already on
+        disk are skipped — and rebuilds the CSVs/Markdown/PDFs afterward.</p>
+      <div class="inline">
+        <input id="bk_label" placeholder="optional label" style="padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg);font-size:13px">
+        <button class="btn" id="backupBtn" onclick="createBackup()">Create backup now</button>
+        <span class="msg" id="backupMsg"></span>
+      </div>
+      <div class="tablewrap" style="margin-top:12px"><table id="backupsTbl"><thead>
+        <tr><th>Backup</th><th>Created</th><th class="num">Receipts</th><th class="num">Size</th><th>Actions</th></tr>
+      </thead><tbody></tbody></table></div>
+    </div>
   </div>
 
   <!-- ============ SEARCH ============ -->
@@ -1082,6 +1164,7 @@ function showTab(name){
   $("tab-users").classList.toggle("active", name==="users");
   if(name==="search") run();
   if(name==="users") loadUsers();
+  if(name==="collect") loadBackups();
 }
 // Show/hide admin-only controls based on ROLE.
 function applyRole(){
@@ -1637,6 +1720,73 @@ async function deleteUser(enc){
   const u = decodeURIComponent(enc);
   if(!confirm(`Delete ${u}? This cannot be undone.`)) return;
   await usersPost("/api/users/delete", { username: u });
+}
+
+// ---------- Backups (admin only) ----------
+function fmtBytes(n){ n = Number(n)||0; if(n<1024) return n+" B";
+  const u=["KB","MB","GB"]; let i=-1; do { n/=1024; i++; } while(n>=1024 && i<2); return n.toFixed(1)+" "+u[i]; }
+function fmtTs(ts){ if(!ts) return ""; try{ return new Date(ts*1000).toISOString().replace("T"," ").slice(0,16); }catch(e){ return ""; } }
+async function loadBackups(){
+  const tb = $("backupsTbl").querySelector("tbody");
+  let d;
+  try{ d = await (await api("/api/backups")).json(); }catch(e){ return; }
+  const rows = d.backups || [];
+  tb.innerHTML = rows.map(b => {
+    const enc = encodeURIComponent(b.name).replace(/'/g,"%27");
+    const cnt = (b.receipt_count==null ? "?" : b.receipt_count);
+    const lbl = b.label ? ` <span style="color:var(--muted)">— ${b.label}</span>` : "";
+    return `<tr>
+      <td><code>${b.name}</code>${lbl}</td>
+      <td>${fmtTs(b.created_at)}</td>
+      <td class="num">${cnt}</td>
+      <td class="num">${fmtBytes(b.size)}</td>
+      <td>
+        <button class="btn secondary" onclick="restoreBackup('${enc}')" title="Restore missing receipts (skips duplicates)">Restore</button>
+        <a class="btn secondary" href="/backup/${enc}" title="Download archive" style="text-decoration:none">Download</a>
+        <button class="btn secondary" onclick="deleteBackup('${enc}')" title="Delete this backup">Delete</button>
+      </td></tr>`;
+  }).join("") || `<tr><td colspan="5" style="color:var(--muted)">No backups yet.</td></tr>`;
+}
+async function createBackup(){
+  const msg = $("backupMsg"); msg.className="msg"; msg.textContent="Creating…";
+  $("backupBtn").disabled = true;
+  try{
+    const r = await api("/api/backups",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({label: $("bk_label").value.trim()})});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; }
+    else { msg.className="msg ok"; msg.textContent = `Backed up ${d.receipt_count} receipts (${fmtBytes(d.size)}).`;
+      $("bk_label").value=""; loadBackups(); }
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
+  $("backupBtn").disabled = false;
+}
+async function restoreBackup(enc){
+  const name = decodeURIComponent(enc);
+  if(!confirm(`Restore from ${name}? Existing receipts are kept; only missing ones are added (no duplicates).`)) return;
+  const msg = $("backupMsg"); msg.className="msg"; msg.textContent="Restoring…";
+  try{
+    const r = await api("/api/backups/restore",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name, render_pdf: true})});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; return; }
+    msg.className="msg ok";
+    msg.textContent = `Restored ${d.restored}, skipped ${d.skipped} duplicate(s)`
+      + (d.invalid ? `, ${d.invalid} invalid` : "") + (d.reprocessing ? " — rebuilding outputs…" : ".");
+    if(d.reprocessing){ if(poll) clearInterval(poll); poll=setInterval(pollStatus,1000); pollStatus(); }
+    loadMeta();
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
+}
+async function deleteBackup(enc){
+  const name = decodeURIComponent(enc);
+  if(!confirm(`Delete backup ${name}? This cannot be undone.`)) return;
+  const msg = $("backupMsg"); msg.className="msg"; msg.textContent="Deleting…";
+  try{
+    const r = await api("/api/backups/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name})});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; return; }
+    msg.className="msg ok"; msg.textContent="Deleted."; loadBackups();
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
 }
 // If a collection is already running when the page loads, resume showing status.
 (async ()=>{

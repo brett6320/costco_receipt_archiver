@@ -309,6 +309,31 @@ without re-downloading. Rendered per-receipt PDFs live in `data/pdfs/`. Re-runni
 the result differs** (content or template change); unchanged files are left
 untouched. Pass `pdf --force` to rewrite every PDF regardless.
 
+## Backups (`data/backups/`)
+
+The imported data (`data/raw/`) is the only thing that can't be regenerated, so
+it can be snapshotted into compressed, timestamped archives
+(`receipts-YYYYMMDD-HHMMSS.tar.gz` — a gzip'd tar of the raw receipts plus a
+`manifest.json`). A backup is taken **automatically after any collection/import
+that brings in new receipts**.
+
+**Restore never creates duplicates.** Each receipt in the archive is keyed by its
+identity (transaction barcode, or a stable composite) and only written if a
+receipt with that identity isn't already on disk — so restoring the same backup
+twice, or one that overlaps your current data, is safe and idempotent. After a
+restore the CSVs/Markdown/PDFs are rebuilt from the merged raw set.
+
+Backups are **admin-only**. Manage them from the web UI's **Collect → Backups**
+panel (create, restore, download, delete), or the CLI:
+
+```bash
+python -m costco_archiver backup create [--label "before cleanup"]
+python -m costco_archiver backup list
+python -m costco_archiver backup restore receipts-20260101-120000.tar.gz  # skips duplicates
+python -m costco_archiver backup delete  receipts-20260101-120000.tar.gz
+python -m costco_archiver import <files…> --no-backup   # opt out of the post-import snapshot
+```
+
 ## Privacy
 
 - `data/` and `.costco_profile/` are git-ignored. The profile holds your logged-in
