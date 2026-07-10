@@ -57,26 +57,76 @@ _CONSOLE_SNIPPET = (
 )
 
 
+def _extract_creds_from_blob(text: str) -> Credentials:
+    """Parse credentials from the JSON blob the console snippet copies.
+
+    Falls back to loose key/value scraping so a partially-mangled paste still
+    works. Handles the raw JSON `{"idToken": "...", "clientID": "..."}`.
+    """
+    text = text.strip()
+    token = client_id = None
+    try:
+        blob = json.loads(text)
+        token = blob.get("idToken") or blob.get("id_token")
+        client_id = blob.get("clientID") or blob.get("clientId")
+    except (ValueError, AttributeError):
+        pass
+    if not (token and client_id):
+        import re
+        m_t = re.search(r'idToken"?\s*[:=]\s*"?([A-Za-z0-9._\-]+)', text)
+        m_c = re.search(r'clientI[dD]"?\s*[:=]\s*"?([A-Za-z0-9._\-]+)', text)
+        token = token or (m_t.group(1) if m_t else None)
+        client_id = client_id or (m_c.group(1) if m_c else None)
+    if not (token and client_id):
+        raise SystemExit(
+            "Couldn't find both idToken and clientID in the input. Make sure you "
+            "ran the snippet and the full JSON was captured."
+        )
+    return Credentials(id_token=token.replace("Bearer ", "").strip(),
+                       client_id=client_id.strip())
+
+
+def _read_clipboard() -> str | None:
+    """Read the macOS clipboard (pbpaste). Returns None if unavailable/empty."""
+    import subprocess
+    try:
+        out = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
+        return out.stdout or None
+    except Exception:
+        return None
+
+
 def cmd_paste_token(args) -> None:
-    """Manually supply credentials grabbed from your own logged-in browser.
+    """Supply credentials grabbed from your own logged-in browser.
 
     Bypasses automated login entirely — useful when Costco bot-blocks (429) the
-    scripted browser. Log into costco.com in your normal browser, open DevTools
-    console, run the snippet below (it copies the values to your clipboard),
-    then paste here.
+    scripted browser. The JWT is long, so we DON'T rely on pasting into a prompt
+    (terminals truncate long pastes). Instead we read the clipboard the console
+    snippet already populated, or a file you point us at.
     """
     config.ensure_dirs()
-    print("In your normal browser, logged into costco.com, open the DevTools")
-    print("Console and run this (it copies the result to your clipboard):\n")
-    print(f"    {_CONSOLE_SNIPPET}\n")
-    token = input("Paste idToken (Bearer value, no 'Bearer '): ").strip()
-    client_id = input("Paste clientID: ").strip()
-    if not token or not client_id:
-        raise SystemExit("Both idToken and clientID are required.")
-    creds = Credentials(id_token=token.replace("Bearer ", "").strip(),
-                        client_id=client_id)
+
+    # 1) --file wins if given.
+    if getattr(args, "file", None):
+        creds = _extract_creds_from_blob(Path(args.file).read_text())
+    else:
+        print("In your normal browser, logged into costco.com, open DevTools →")
+        print("Console and run this (it copies the JSON to your clipboard):\n")
+        print(f"    {_CONSOLE_SNIPPET}\n")
+        clip = _read_clipboard()
+        if clip and ("idToken" in clip or "clientID" in clip):
+            print(">>> Read credentials from your clipboard.")
+            creds = _extract_creds_from_blob(clip)
+        else:
+            print("Clipboard didn't contain the token. Alternatives:")
+            print("  • re-run the snippet, then: python -m costco_archiver paste-token")
+            print("  • or save the JSON to a file and pass --file <path>\n")
+            raise SystemExit("No credentials found on clipboard.")
+
     CRED_CACHE.write_text(json.dumps(asdict(creds), indent=2))
-    print(f"\nSaved to {CRED_CACHE}. Now run: python -m costco_archiver fetch")
+    print(f"\nSaved to {CRED_CACHE}.")
+    print("Token is valid ~1 hour — run this now:")
+    print("    python -m costco_archiver fetch && python -m costco_archiver parse")
 
 
 def cmd_fetch(args) -> None:
@@ -136,6 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("paste-token",
                         help="manually supply token from your own browser (bypasses 429)")
+    sp.add_argument("--file", default=None,
+                    help="path to a file containing the JSON blob (instead of clipboard)")
     sp.set_defaults(func=cmd_paste_token)
 
     sp = sub.add_parser("fetch", help="download warehouse/gas receipts")

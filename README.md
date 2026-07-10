@@ -92,10 +92,12 @@ Fixes, in order of reliability:
    ```bash
    python -m costco_archiver paste-token
    ```
-   It prints a one-line DevTools Console snippet that copies your `idToken` and
-   `clientID` to the clipboard; paste them in and the tool caches them. Then run
-   `python -m costco_archiver fetch`. (Tokens expire in ~1 hour — re-paste if a
-   fetch starts returning 401.)
+   It prints a one-line DevTools Console snippet that **copies** your `idToken`
+   and `clientID` to the clipboard; the command then reads them straight off the
+   clipboard (`pbpaste`) — no pasting into the terminal, so the long JWT can't be
+   truncated. Then run `python -m costco_archiver fetch`. Prefer a file instead?
+   Save the JSON and pass `--file <path>`. (Tokens expire in ~1 hour — re-run
+   `paste-token` if a fetch starts returning 401.)
 
 ### Other
 
