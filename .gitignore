@@ -1,0 +1,12 @@
+# Playwright persistent browser profile (contains your logged-in session!)
+.costco_profile/
+
+# Downloaded data
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
