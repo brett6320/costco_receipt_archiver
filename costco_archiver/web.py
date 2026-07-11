@@ -14,6 +14,7 @@ import csv
 import json
 import re
 import threading
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -734,6 +735,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(ex)}).encode())
 
 
+def _start_backup_scheduler() -> None:
+    """Background thread that snapshots the imported data on an interval (default
+    daily) and prunes old automatic backups. A tick is a no-op when the raw data
+    hasn't changed since the last backup. Controlled by COSTCO_BACKUP_* env."""
+    if not config.BACKUP_DAILY:
+        return
+    interval = max(0.1, config.BACKUP_INTERVAL_HOURS) * 3600.0
+
+    def _loop():
+        time.sleep(15)  # let startup settle before the first check
+        while True:
+            try:
+                from . import backup
+                res = backup.daily_backup_tick(keep=config.BACKUP_KEEP)
+                if res.get("created"):
+                    c = res["created"]
+                    print(f"[backup] daily snapshot {c['name']} "
+                          f"({c['receipt_count']} receipts, {c['size'] // 1024} KB)")
+                if res.get("pruned"):
+                    print(f"[backup] pruned {len(res['pruned'])} old backup(s)")
+            except Exception as ex:
+                print(f"[backup] scheduler error: {ex}")
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    every = config.BACKUP_INTERVAL_HOURS
+    print(f"Automatic backups: every {every:g}h, keeping newest "
+          f"{config.BACKUP_KEEP} (COSTCO_BACKUP_DAILY=0 to disable).")
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     config.ensure_dirs()
     _Handler.rows = _load_rows()
@@ -742,6 +773,7 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     if not webauth.users_exist():
         print("⚠ No web accounts configured — the login page will reject everyone.\n"
               "  Create one first:  python -m costco_archiver auth adduser <name>")
+    _start_backup_scheduler()
     httpd = ThreadingHTTPServer((host, port), _Handler)
     url = f"http://{host}:{port}"
     print(f"Serving {len(_Handler.rows)} line items at {url}  "
@@ -999,6 +1031,10 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div id="view-collect" class="hidden">
     <div class="card">
       <h2>1 · Capture credentials (import-curl)</h2>
+      <p style="font-size:13px;color:var(--muted);margin:0 0 8px">
+        New here? Follow the
+        <a href="https://github.com/brett6320/costco_receipt_archiver/blob/main/docs/quickstart-collect.md"
+           target="_blank" rel="noopener">step-by-step quickstart guide</a>.</p>
       <ol class="steps">
         <li>In your <b>normal browser</b>, log in at <code>costco.com</code> and open your <b>Orders &amp; Purchases → Receipts</b> page.</li>
         <li>Open <b>DevTools</b> (F12 / ⌥⌘I) → <b>Network</b> tab. In the filter box type <code>graphql</code>.</li>

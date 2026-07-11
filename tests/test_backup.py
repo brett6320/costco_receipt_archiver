@@ -73,9 +73,47 @@ def run(tmp: Path):
     print("\nALL BACKUP TESTS PASSED")
 
 
+def run_daily(tmp: Path):
+    """Scheduled-backup behaviour: snapshot only on change, prune keeps N autos
+    and never touches manual backups."""
+    import time
+    raw = tmp / "raw"; bdir = tmp / "backups"; raw.mkdir()
+
+    def add(bc):
+        (raw / f"{bc}.json").write_text(json.dumps(_receipt(bc, 1)))
+
+    # No receipts -> skip.
+    r = bk.daily_backup_tick(keep=5, raw_dir=raw, backup_dir=bdir)
+    assert r["skipped"] and r["reason"] == "no receipts", r
+
+    add("AAA")
+    assert bk.daily_backup_tick(keep=5, raw_dir=raw, backup_dir=bdir)["created"], "first snapshot"
+    # Unchanged -> skip (no duplicate daily archive).
+    r = bk.daily_backup_tick(keep=5, raw_dir=raw, backup_dir=bdir)
+    assert r["skipped"] and r["reason"] == "unchanged", r
+    add("BBB")
+    assert bk.daily_backup_tick(keep=5, raw_dir=raw, backup_dir=bdir)["created"], "snapshot after change"
+
+    # Retention: a manual backup + several autos, keep=2 -> only autos pruned.
+    bk.create_backup(raw_dir=raw, backup_dir=bdir, label="manual-keep-me")
+    for i in range(3):
+        add(f"C{i}")
+        bk.create_backup(raw_dir=raw, backup_dir=bdir, label="auto: daily")
+        time.sleep(1.05)  # keep timestamps (and names) distinct
+    bk.prune_backups(keep=2, backup_dir=bdir)
+    autos = [b for b in bk.list_backups(bdir) if b["label"].startswith("auto:")]
+    manual = [b for b in bk.list_backups(bdir) if b["label"] == "manual-keep-me"]
+    assert len(autos) == 2, autos
+    assert len(manual) == 1, "prune deleted a manual backup!"
+    print("daily OK: snapshot-on-change only, unchanged ticks skipped,")
+    print("          retention keeps newest 2 autos and never prunes manual backups")
+    print("\nALL DAILY-BACKUP TESTS PASSED")
+
+
 if __name__ == "__main__":
-    d = Path(tempfile.mkdtemp())
-    try:
-        run(d)
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+    for fn in (run, run_daily):
+        d = Path(tempfile.mkdtemp())
+        try:
+            fn(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

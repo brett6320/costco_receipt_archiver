@@ -411,6 +411,21 @@ def cmd_backup_delete(args) -> None:
     print(f"✓ Deleted {args.name}.")
 
 
+def cmd_backup_daily(args) -> None:
+    """One scheduled-backup cycle (snapshot if changed, then prune). Meant for a
+    cron job when you're not running the web server (which schedules its own)."""
+    from .backup import daily_backup_tick
+    res = daily_backup_tick(keep=getattr(args, "keep", None))
+    if res.get("created"):
+        c = res["created"]
+        print(f"✓ Snapshot {c['name']} "
+              f"({c['receipt_count']} receipts, {c['size'] // 1024} KB)")
+    else:
+        print(f"• Skipped ({res.get('reason')}).")
+    if res.get("pruned"):
+        print(f"  Pruned {len(res['pruned'])} old backup(s).")
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
     cmd_parse(args)
@@ -530,6 +545,12 @@ def build_parser() -> argparse.ArgumentParser:
     b = bsub.add_parser("delete", help="delete a backup")
     b.add_argument("name")
     b.set_defaults(func=cmd_backup_delete)
+    b = bsub.add_parser("daily",
+                        help="run one scheduled backup cycle (snapshot if changed, "
+                             "then prune) — for cron")
+    b.add_argument("--keep", type=int, default=None,
+                   help="retain N automatic backups (default: COSTCO_BACKUP_KEEP)")
+    b.set_defaults(func=cmd_backup_daily)
 
     sp = sub.add_parser("markdown",
                         help="generate a Markdown archive (index + per-receipt pages)")

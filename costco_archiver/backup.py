@@ -16,6 +16,7 @@ also available from the CLI (``python -m costco_archiver backup …``).
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -27,6 +28,10 @@ from pathlib import Path
 from . import config
 from .ingest import _safe_name
 from .parse import _receipt_key
+
+# Auto-created backups carry a label starting with this prefix; only these are
+# eligible for retention pruning (manual / labelled backups are always kept).
+_AUTO_PREFIX = "auto:"
 
 # Backup file names we create and will accept back for restore/delete. Anchoring
 # on this exact shape also hardens delete/restore against path-traversal names.
@@ -60,6 +65,30 @@ def _existing_keys(raw_dir: Path) -> set[str]:
     return keys
 
 
+def _fingerprint(keys) -> str:
+    """A stable digest of the set of receipt identities — two raw dirs with the
+    same receipts share a fingerprint, so we can skip an unchanged daily backup."""
+    joined = "\n".join(sorted(k for k in keys if k))
+    return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def raw_fingerprint(raw_dir: Path = config.RAW_DIR) -> str:
+    return _fingerprint(_existing_keys(raw_dir))
+
+
+def latest_fingerprint(backup_dir: Path = config.BACKUP_DIR) -> str | None:
+    """Fingerprint recorded in the most recent backup, or None if there are none."""
+    for f in sorted(backup_dir.glob(_ARCHIVE_GLOB), reverse=True):
+        try:
+            with tarfile.open(f, "r:gz") as tar:
+                m = tar.extractfile("manifest.json")
+                if m is not None:
+                    return json.loads(m.read().decode()).get("fingerprint")
+        except Exception:
+            continue
+    return None
+
+
 def create_backup(raw_dir: Path = config.RAW_DIR,
                   backup_dir: Path = config.BACKUP_DIR,
                   label: str = "") -> dict:
@@ -91,6 +120,7 @@ def create_backup(raw_dir: Path = config.RAW_DIR,
         "created_at": now,
         "receipt_count": len(files),
         "label": str(label or ""),
+        "fingerprint": _fingerprint(keys),
         "keys": keys,
     }
     with tarfile.open(out, "w:gz") as tar:
@@ -192,3 +222,39 @@ def delete_backup(name: str, backup_dir: Path = config.BACKUP_DIR) -> None:
 def backup_bytes(name: str, backup_dir: Path = config.BACKUP_DIR) -> bytes:
     """Raw archive bytes, for the download endpoint."""
     return _safe_backup_path(name, backup_dir).read_bytes()
+
+
+def prune_backups(keep: int, backup_dir: Path = config.BACKUP_DIR) -> list[str]:
+    """Keep the newest `keep` AUTOMATIC backups; delete older ones. Manual /
+    labelled backups are never pruned. Returns the names removed."""
+    if keep is None or keep < 0:
+        return []
+    autos = [b for b in list_backups(backup_dir)
+             if str(b.get("label", "")).startswith(_AUTO_PREFIX)]
+    removed = []
+    for b in autos[keep:]:  # list_backups is newest-first
+        try:
+            delete_backup(b["name"], backup_dir)
+            removed.append(b["name"])
+        except Exception:
+            continue
+    return removed
+
+
+def daily_backup_tick(keep: int = None, raw_dir: Path = config.RAW_DIR,
+                      backup_dir: Path = config.BACKUP_DIR) -> dict:
+    """One scheduled-backup cycle: snapshot the raw data if it changed since the
+    last backup, then prune old automatic backups. Returns what happened."""
+    if keep is None:
+        keep = config.BACKUP_KEEP
+    raw_fp = raw_fingerprint(raw_dir)
+    # Nothing imported yet, or unchanged since the last backup → skip (but still
+    # prune, in case retention shrank).
+    files_present = any(raw_dir.glob("*.json")) if raw_dir.exists() else False
+    if not files_present or raw_fp == latest_fingerprint(backup_dir):
+        return {"created": None, "skipped": True,
+                "reason": "no receipts" if not files_present else "unchanged",
+                "pruned": prune_backups(keep, backup_dir)}
+    meta = create_backup(raw_dir=raw_dir, backup_dir=backup_dir, label="auto: daily")
+    return {"created": meta, "skipped": False,
+            "pruned": prune_backups(keep, backup_dir)}

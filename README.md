@@ -260,7 +260,9 @@ Sign in with your password + authenticator code (see
 - **Collect** — on-screen instructions to grab a DevTools *Copy as cURL* of the
   receipts request, a box to paste it (**Capture**), then **Start collection**
   (default **36 months**, newest first) with a live progress bar and streaming
-  log as it fetches, parses, renders PDFs, and builds Markdown.
+  log as it fetches, parses, renders PDFs, and builds Markdown. New to this?
+  Follow the **[Collect quickstart guide](docs/quickstart-collect.md)** — a
+  step-by-step walkthrough of extracting the token from your browser.
 - **Search** — free-text (with `item:` / `store:` / `rcpt:` tokens and a leading
   `-` to exclude) plus date / price / item-number / type / tax / warehouse filters
   and a **Has discount** toggle; sortable columns; a **Group by item #** mode;
@@ -315,7 +317,15 @@ The imported data (`data/raw/`) is the only thing that can't be regenerated, so
 it can be snapshotted into compressed, timestamped archives
 (`receipts-YYYYMMDD-HHMMSS.tar.gz` — a gzip'd tar of the raw receipts plus a
 `manifest.json`). A backup is taken **automatically after any collection/import
-that brings in new receipts**.
+that brings in new receipts**, and the web server runs a **daily** scheduled
+backup while it's up. A scheduled backup is skipped when the raw data hasn't
+changed since the last one, so identical archives don't pile up. Retention keeps
+the newest `COSTCO_BACKUP_KEEP` **automatic** backups (default 14); manually
+created / labelled backups are never pruned. Tune with:
+
+- `COSTCO_BACKUP_DAILY` — set `0` to disable the scheduler (default on).
+- `COSTCO_BACKUP_INTERVAL_HOURS` — snapshot interval (default `24`).
+- `COSTCO_BACKUP_KEEP` — how many automatic backups to retain (default `14`).
 
 **Restore never creates duplicates.** Each receipt in the archive is keyed by its
 identity (transaction barcode, or a stable composite) and only written if a
@@ -331,7 +341,17 @@ python -m costco_archiver backup create [--label "before cleanup"]
 python -m costco_archiver backup list
 python -m costco_archiver backup restore receipts-20260101-120000.tar.gz  # skips duplicates
 python -m costco_archiver backup delete  receipts-20260101-120000.tar.gz
+python -m costco_archiver backup daily [--keep 14]   # snapshot-if-changed + prune (for cron)
 python -m costco_archiver import <files…> --no-backup   # opt out of the post-import snapshot
+```
+
+The web server backs up daily on its own. If you run the CLI instead, schedule
+`backup daily` with cron — it snapshots only when the data changed and prunes old
+automatic backups:
+
+```cron
+# 2:30am daily
+30 2 * * *  cd /path/to/costco_receipt_archiver && python -m costco_archiver backup daily
 ```
 
 ## Privacy
