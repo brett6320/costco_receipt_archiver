@@ -518,11 +518,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, json.dumps({"users": webauth.users_overview()}).encode())
         elif path == "/api/backups":
-            # Admin-only: list compressed raw-data backups.
+            # Admin-only: list compressed raw-data backups + the schedule/retention.
             if not self._require_admin():
                 return
             from . import backup
-            self._send(200, json.dumps({"backups": backup.list_backups()}).encode())
+            self._send(200, json.dumps({
+                "backups": backup.list_backups(),
+                "schedule": {"daily": config.BACKUP_DAILY,
+                             "interval_hours": config.BACKUP_INTERVAL_HOURS,
+                             "keep": config.BACKUP_KEEP},
+            }).encode())
         elif path.startswith("/backup/"):
             # Admin-only: download a backup archive.
             if not self._require_admin():
@@ -916,7 +921,10 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   .enroll { background:var(--code); border:1px solid var(--bd); border-radius:6px; padding:10px 12px; margin-top:10px; font-size:13px; line-height:1.7; }
   .enroll code { word-break:break-all; }
   #usersTbl td, #usersTbl th { white-space:nowrap; }
-  #usersTbl .btn.secondary { padding:5px 9px; font-size:12px; margin-right:4px; }
+  #usersTbl .btn.secondary, #backupsTbl .btn.secondary { padding:5px 9px; font-size:12px; margin-right:4px; }
+  #backupsTbl td, #backupsTbl th { white-space:nowrap; }
+  .sched { font-size:12px; color:var(--muted); background:var(--chip); border-radius:6px; padding:7px 10px; display:inline-block; }
+  .sched b { color:var(--fg); }
   .bar { height:10px; background:var(--chip); border-radius:6px; overflow:hidden; margin:10px 0; }
   .bar > div { height:100%; background:var(--accent); width:0%; transition:width .3s; }
   .log { background:var(--log-bg); color:var(--log-fg); font-family:ui-monospace,Menlo,monospace; font-size:12px; border-radius:6px; padding:10px; height:200px; overflow:auto; white-space:pre-wrap; }
@@ -1016,6 +1024,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <button id="tab-search" class="active" onclick="showTab('search')">Search</button>
     <button id="tab-collect" class="hidden" onclick="showTab('collect')">Collect</button>
     <button id="tab-users" class="hidden" onclick="showTab('users')">Users</button>
+    <button id="tab-backups" class="hidden" onclick="showTab('backups')">Backups</button>
     <select id="theme" class="themesel" title="Theme" onchange="setTheme(this.value)">
       <option value="system">🖥 System</option>
       <option value="light">☀ Light</option>
@@ -1074,23 +1083,6 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         <button class="btn secondary" id="reprocessBtn" onclick="reprocess()">Refresh metadata</button>
         <span class="msg" id="reprocessMsg"></span>
       </div>
-    </div>
-
-    <div class="card">
-      <h2>4 · Backups</h2>
-      <p style="font-size:13px;color:var(--muted);margin:0 0 10px">
-        Compressed snapshots of your imported receipts (<code>data/raw</code>). A
-        backup is taken automatically after each collection that brings in new
-        receipts. <b>Restore never creates duplicates</b> — receipts already on
-        disk are skipped — and rebuilds the CSVs/Markdown/PDFs afterward.</p>
-      <div class="inline">
-        <input id="bk_label" placeholder="optional label" style="padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg);font-size:13px">
-        <button class="btn" id="backupBtn" onclick="createBackup()">Create backup now</button>
-        <span class="msg" id="backupMsg"></span>
-      </div>
-      <div class="tablewrap" style="margin-top:12px"><table id="backupsTbl"><thead>
-        <tr><th>Backup</th><th>Created</th><th class="num">Receipts</th><th class="num">Size</th><th>Actions</th></tr>
-      </thead><tbody></tbody></table></div>
     </div>
   </div>
 
@@ -1162,6 +1154,32 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="msg" id="um_msg"></div>
     </div>
   </div>
+
+  <!-- ============ BACKUPS (admin only) ============ -->
+  <div id="view-backups" class="hidden">
+    <div class="card">
+      <h2>Backups</h2>
+      <p style="font-size:13px;color:var(--muted);margin:0 0 10px">
+        Compressed snapshots of your imported receipts (<code>data/raw</code>) — the
+        only data that can't be regenerated. A backup is taken automatically after a
+        collection/import that brings in new receipts, plus on a schedule.
+        <b>Restore never creates duplicates</b>: receipts already on disk are skipped,
+        and the CSVs/Markdown/PDFs rebuild afterward.</p>
+      <div id="bk_schedule" class="sched"></div>
+      <div class="inline" style="margin-top:10px">
+        <input id="bk_label" placeholder="optional label" style="padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg);font-size:13px">
+        <button class="btn" id="backupBtn" onclick="createBackup()">Create backup now</button>
+        <button class="btn secondary" id="backupReloadBtn" onclick="loadBackups()">↻ Refresh list</button>
+        <span class="msg" id="backupMsg"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Available backups</h2>
+      <div class="tablewrap"><table id="backupsTbl"><thead>
+        <tr><th>Backup</th><th>Created</th><th class="num">Receipts</th><th class="num">Size</th><th>Actions</th></tr>
+      </thead><tbody></tbody></table></div>
+    </div>
+  </div>
 </div>
 
 <!-- Price-history modal -->
@@ -1189,28 +1207,27 @@ async function logout(){
 // Current user's role, set from /api/auth/status. Operators are read-only.
 let ROLE = "";
 function isAdmin(){ return ROLE === "admin"; }
+const ADMIN_TABS = ["collect","users","backups"];
 function showTab(name){
   // Operators can't reach admin-only tabs — fall back to Search.
-  if((name==="collect" || name==="users") && !isAdmin()) name = "search";
-  $("view-collect").classList.toggle("hidden", name!=="collect");
-  $("view-search").classList.toggle("hidden", name!=="search");
-  $("view-users").classList.toggle("hidden", name!=="users");
-  $("tab-collect").classList.toggle("active", name==="collect");
-  $("tab-search").classList.toggle("active", name==="search");
-  $("tab-users").classList.toggle("active", name==="users");
+  if(ADMIN_TABS.includes(name) && !isAdmin()) name = "search";
+  ["search","collect","users","backups"].forEach(v => {
+    $("view-"+v).classList.toggle("hidden", name!==v);
+    const tb = $("tab-"+v); if(tb) tb.classList.toggle("active", name===v);
+  });
   if(name==="search") run();
   if(name==="users") loadUsers();
-  if(name==="collect") loadBackups();
+  if(name==="backups") loadBackups();
 }
 // Show/hide admin-only controls based on ROLE.
 function applyRole(){
   const admin = isAdmin();
-  ["tab-collect","tab-users","refreshBtn"].forEach(id => {
+  ["tab-collect","tab-users","tab-backups","refreshBtn"].forEach(id => {
     const el = $(id); if(el) el.classList.toggle("hidden", !admin);
   });
   // If an operator is somehow parked on an admin tab, bounce them to Search.
-  if(!admin && (!$("view-collect").classList.contains("hidden")
-             || !$("view-users").classList.contains("hidden"))) showTab("search");
+  if(!admin && ["view-collect","view-users","view-backups"].some(
+        v => !$(v).classList.contains("hidden"))) showTab("search");
 }
 
 // ---------- Collect ----------
@@ -1766,6 +1783,13 @@ async function loadBackups(){
   const tb = $("backupsTbl").querySelector("tbody");
   let d;
   try{ d = await (await api("/api/backups")).json(); }catch(e){ return; }
+  const s = d.schedule || {};
+  const sch = $("bk_schedule");
+  if(sch){
+    sch.innerHTML = s.daily
+      ? `Automatic backups: <b>every ${(+s.interval_hours||24)}h</b>, keeping the newest <b>${s.keep}</b> (manual backups are never pruned).`
+      : `Automatic backups are <b>disabled</b> (set <code>COSTCO_BACKUP_DAILY=1</code> to enable).`;
+  }
   const rows = d.backups || [];
   tb.innerHTML = rows.map(b => {
     const enc = encodeURIComponent(b.name).replace(/'/g,"%27");

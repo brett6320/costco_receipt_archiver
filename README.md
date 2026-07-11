@@ -333,8 +333,9 @@ receipt with that identity isn't already on disk — so restoring the same backu
 twice, or one that overlaps your current data, is safe and idempotent. After a
 restore the CSVs/Markdown/PDFs are rebuilt from the merged raw set.
 
-Backups are **admin-only**. Manage them from the web UI's **Collect → Backups**
-panel (create, restore, download, delete), or the CLI:
+Backups are **admin-only**. Manage them from the web UI's dedicated **Backups**
+tab (create, restore, download, delete, and view the schedule/retention), or the
+CLI:
 
 ```bash
 python -m costco_archiver backup create [--label "before cleanup"]
