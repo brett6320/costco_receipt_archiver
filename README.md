@@ -320,10 +320,15 @@ it can be snapshotted into compressed, timestamped archives
 that brings in new receipts**, and the web server runs a **daily** scheduled
 backup while it's up. A scheduled backup is skipped when the raw data hasn't
 changed since the last one, so identical archives don't pile up. Retention keeps
-the newest `COSTCO_BACKUP_KEEP` **automatic** backups (default 14); manually
-created / labelled backups are never pruned. Tune with:
+the newest N **automatic** backups; manually created / labelled backups are never
+pruned.
 
-- `COSTCO_BACKUP_DAILY` — set `0` to disable the scheduler (default on).
+The schedule is **editable from the Backups tab** (enable/disable, interval, and
+how many to keep) and persisted to `data/backup_settings.json`, with a **Prune
+now** button to apply retention immediately — changes take effect within ~a
+minute, no restart needed. The `COSTCO_BACKUP_*` env vars just seed the defaults:
+
+- `COSTCO_BACKUP_DAILY` — scheduler on/off (default on).
 - `COSTCO_BACKUP_INTERVAL_HOURS` — snapshot interval (default `24`).
 - `COSTCO_BACKUP_KEEP` — how many automatic backups to retain (default `14`).
 
