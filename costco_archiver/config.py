@@ -16,6 +16,7 @@ DATA_DIR = ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"           # raw JSON responses, one file per receipt
 OUTPUT_DIR = DATA_DIR / "output"     # parsed CSV / summaries
 PDF_DIR = DATA_DIR / "pdfs"          # per-receipt PDF archive (+ captured PDFs)
+BACKUP_DIR = DATA_DIR / "backups"    # compressed (.tar.gz) snapshots of raw receipts
 
 # Exact request headers captured from the browser's own receipts call. Preferred
 # over reconstructed headers because they include everything the API expects.
@@ -68,6 +69,22 @@ except ValueError:
 COOKIE_SECURE = (os.environ.get("COSTCO_WEB_HTTPS", "").lower()
                  in ("1", "true", "yes", "on"))
 
+# --- Automatic backups --------------------------------------------------------
+# The web server runs a background scheduler that snapshots data/raw on an
+# interval (default daily) and keeps the newest N automatic backups. Manual /
+# labelled backups are never pruned. A tick is a no-op when the raw data hasn't
+# changed since the last backup, so identical archives aren't piled up.
+BACKUP_DAILY = (os.environ.get("COSTCO_BACKUP_DAILY", "1").lower()
+                in ("1", "true", "yes", "on"))
+try:
+    BACKUP_INTERVAL_HOURS = float(os.environ.get("COSTCO_BACKUP_INTERVAL_HOURS") or 24)
+except ValueError:
+    BACKUP_INTERVAL_HOURS = 24.0
+try:
+    BACKUP_KEEP = int(os.environ.get("COSTCO_BACKUP_KEEP") or 14)  # retention count
+except ValueError:
+    BACKUP_KEEP = 14
+
 # A modern desktop UA reduces the chance of being served a degraded/blocked page.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -76,5 +93,5 @@ USER_AGENT = (
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, RAW_DIR, OUTPUT_DIR, PDF_DIR):
+    for d in (DATA_DIR, RAW_DIR, OUTPUT_DIR, PDF_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)

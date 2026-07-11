@@ -218,6 +218,15 @@ def cmd_import(args) -> None:
             raise SystemExit("Provide file/dir paths, or --clipboard.")
         summary = ingest_paths([Path(p) for p in args.paths])
     print(json.dumps(summary, indent=2))
+    # Snapshot the imported data (unless suppressed) so every import is restorable.
+    if summary.get("ingested") and not getattr(args, "no_backup", False):
+        try:
+            from .backup import create_backup
+            b = create_backup(label="auto: after import")
+            print(f"Backed up {b['receipt_count']} receipts → {b['name']} "
+                  f"({b['size'] // 1024} KB)")
+        except Exception as ex:
+            print(f"(backup skipped: {ex})")
 
 
 def cmd_pdf(args) -> None:
@@ -350,6 +359,73 @@ def cmd_auth_users(args) -> None:
         print(f"  • {u['username']:<20} {u['role']}")
 
 
+def _fmt_backup_ts(ts) -> str:
+    import datetime
+    if not ts:
+        return ""
+    return datetime.datetime.fromtimestamp(
+        int(ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def cmd_backup_create(args) -> None:
+    from .backup import create_backup
+    b = create_backup(label=getattr(args, "label", "") or "")
+    print(f"✓ Backup created: {b['name']} "
+          f"({b['receipt_count']} receipts, {b['size'] // 1024} KB)")
+
+
+def cmd_backup_list(args) -> None:
+    from .backup import list_backups
+    backups = list_backups()
+    if not backups:
+        print("No backups yet. Create one: python -m costco_archiver backup create")
+        return
+    print("Backups (newest first):")
+    for b in backups:
+        cnt = b["receipt_count"] if b["receipt_count"] is not None else "?"
+        label = f"  — {b['label']}" if b.get("label") else ""
+        print(f"  • {b['name']:<30} {_fmt_backup_ts(b.get('created_at'))}  "
+              f"{cnt} receipts  {b['size'] // 1024} KB{label}")
+
+
+def cmd_backup_restore(args) -> None:
+    from .backup import restore_backup
+    try:
+        r = restore_backup(args.name)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    extra = f", {r['invalid']} invalid" if r["invalid"] else ""
+    print(f"✓ Restored {r['restored']}, skipped {r['skipped']} duplicate(s){extra} "
+          f"(of {r['total']}).")
+    if r["restored"]:
+        print("  Rebuild outputs:  python -m costco_archiver parse "
+              "&& python -m costco_archiver markdown && python -m costco_archiver pdf")
+
+
+def cmd_backup_delete(args) -> None:
+    from .backup import delete_backup
+    try:
+        delete_backup(args.name)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    print(f"✓ Deleted {args.name}.")
+
+
+def cmd_backup_daily(args) -> None:
+    """One scheduled-backup cycle (snapshot if changed, then prune). Meant for a
+    cron job when you're not running the web server (which schedules its own)."""
+    from .backup import daily_backup_tick
+    res = daily_backup_tick(keep=getattr(args, "keep", None))
+    if res.get("created"):
+        c = res["created"]
+        print(f"✓ Snapshot {c['name']} "
+              f"({c['receipt_count']} receipts, {c['size'] // 1024} KB)")
+    else:
+        print(f"• Skipped ({res.get('reason')}).")
+    if res.get("pruned"):
+        print(f"  Pruned {len(res['pruned'])} old backup(s).")
+
+
 def cmd_all(args) -> None:
     cmd_fetch(args)
     cmd_parse(args)
@@ -411,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("paths", nargs="*", help="receipt .html/.pdf files or directories")
     sp.add_argument("--clipboard", action="store_true",
                     help="ingest a receipt's HTML copied to the clipboard")
+    sp.add_argument("--no-backup", action="store_true",
+                    help="don't auto-create a compressed backup after importing")
     sp.set_defaults(func=cmd_import)
 
     sp = sub.add_parser("pdf", help="render each receipt to a PDF archive (data/pdfs)")
@@ -451,6 +529,28 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_auth_deluser)
     a = asub.add_parser("users", help="list accounts and their roles")
     a.set_defaults(func=cmd_auth_users)
+
+    sp = sub.add_parser("backup",
+                        help="manage compressed backups of imported receipts (data/raw)")
+    bsub = sp.add_subparsers(dest="backup_command", required=True)
+    b = bsub.add_parser("create", help="snapshot data/raw into a .tar.gz backup")
+    b.add_argument("--label", default="", help="optional label stored in the backup")
+    b.set_defaults(func=cmd_backup_create)
+    b = bsub.add_parser("list", help="list backups")
+    b.set_defaults(func=cmd_backup_list)
+    b = bsub.add_parser("restore",
+                        help="restore receipts from a backup (skips duplicates)")
+    b.add_argument("name", help="backup filename (see `backup list`)")
+    b.set_defaults(func=cmd_backup_restore)
+    b = bsub.add_parser("delete", help="delete a backup")
+    b.add_argument("name")
+    b.set_defaults(func=cmd_backup_delete)
+    b = bsub.add_parser("daily",
+                        help="run one scheduled backup cycle (snapshot if changed, "
+                             "then prune) — for cron")
+    b.add_argument("--keep", type=int, default=None,
+                   help="retain N automatic backups (default: COSTCO_BACKUP_KEEP)")
+    b.set_defaults(func=cmd_backup_daily)
 
     sp = sub.add_parser("markdown",
                         help="generate a Markdown archive (index + per-receipt pages)")
