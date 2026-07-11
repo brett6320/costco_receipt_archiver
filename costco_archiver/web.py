@@ -504,8 +504,14 @@ class _Handler(BaseHTTPRequestHandler):
             # warehouse can appear under several name spellings.
             wh_nums = {r.get("warehouse_number", "") for r in self.rows if r.get("warehouse_number")}
             dates = sorted({r.get("date", "") for r in self.rows if r.get("date")})
+            # Distinct product item numbers (excluding discount/tax adjustment
+            # lines, whose "item number" is a code, not a product).
+            unique_items = len({r.get("item_number", "") for r in self.rows
+                                if r.get("item_number")
+                                and r.get("order_type") not in ("discount", "tax")})
             meta = {
                 "total_line_items": len(self.rows),
+                "unique_items": unique_items,
                 "warehouses": warehouses,
                 "warehouse_count": len(wh_nums) if wh_nums else len(warehouses),
                 "date_min": dates[0] if dates else "",
@@ -1732,7 +1738,8 @@ function exportExcel(){
 async function loadMeta(){
   const m = await (await api("/api/meta")).json();
   const whn = (m.warehouse_count!=null ? m.warehouse_count : m.warehouses.length);
-  $("meta").textContent = `${m.total_line_items.toLocaleString()} line items · ${m.date_min||"?"} → ${m.date_max||"?"} · ${whn} warehouses`;
+  const uniq = (m.unique_items!=null) ? ` · ${m.unique_items.toLocaleString()} unique items` : "";
+  $("meta").textContent = `${m.total_line_items.toLocaleString()} line items${uniq} · ${m.date_min||"?"} → ${m.date_max||"?"} · ${whn} warehouses`;
 }
 async function loadWhoami(){
   try{
