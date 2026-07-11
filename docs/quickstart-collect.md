@@ -62,7 +62,7 @@ collect right away.
 3. Click **Start collection** and watch the live log.
 
 When it finishes, switch to the **Search** tab to browse everything. Your imported
-data is snapshotted into a **backup** automatically (see **Collect → Backups**),
+data is snapshotted into a **backup** automatically (see the **Backups** tab),
 and a daily backup runs while the app is up.
 
 ---
