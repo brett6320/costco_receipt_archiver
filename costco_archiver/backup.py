@@ -21,6 +21,7 @@ import io
 import json
 import re
 import tarfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,56 @@ from .parse import _receipt_key
 # Auto-created backups carry a label starting with this prefix; only these are
 # eligible for retention pruning (manual / labelled backups are always kept).
 _AUTO_PREFIX = "auto:"
+
+_SETTINGS_LOCK = threading.Lock()
+
+
+# --- schedule / retention settings -------------------------------------------
+# The COSTCO_BACKUP_* env values are the DEFAULTS; admins can override them at
+# runtime from the UI, persisted to data/backup_settings.json so they survive
+# restarts. get_settings() merges the two (persisted wins).
+def _settings_path() -> Path:
+    return config.DATA_DIR / "backup_settings.json"
+
+
+def get_settings() -> dict:
+    """Effective schedule settings: {daily, interval_hours, keep}."""
+    daily, interval, keep = (config.BACKUP_DAILY, config.BACKUP_INTERVAL_HOURS,
+                             config.BACKUP_KEEP)
+    try:
+        raw = json.loads(_settings_path().read_text())
+        if isinstance(raw.get("daily"), bool):
+            daily = raw["daily"]
+        iv = raw.get("interval_hours")
+        if isinstance(iv, (int, float)) and iv > 0:
+            interval = float(iv)
+        k = raw.get("keep")
+        if isinstance(k, int) and not isinstance(k, bool) and k >= 0:
+            keep = k
+    except Exception:
+        pass  # missing/corrupt file → fall back to env defaults
+    return {"daily": bool(daily), "interval_hours": float(interval), "keep": int(keep)}
+
+
+def update_settings(daily=None, interval_hours=None, keep=None) -> dict:
+    """Persist changed schedule settings (validated). Returns the new settings."""
+    with _SETTINGS_LOCK:
+        cur = get_settings()
+        if daily is not None:
+            cur["daily"] = bool(daily)
+        if interval_hours is not None:
+            iv = float(interval_hours)
+            if not (0 < iv <= 720):  # up to 30 days
+                raise ValueError("interval_hours must be between 0 and 720")
+            cur["interval_hours"] = iv
+        if keep is not None:
+            k = int(keep)
+            if not (0 <= k <= 1000):
+                raise ValueError("keep must be between 0 and 1000")
+            cur["keep"] = k
+        config.ensure_dirs()
+        _settings_path().write_text(json.dumps(cur, indent=2))
+        return cur
 
 # Backup file names we create and will accept back for restore/delete. Anchoring
 # on this exact shape also hardens delete/restore against path-traversal names.

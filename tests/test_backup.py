@@ -110,8 +110,34 @@ def run_daily(tmp: Path):
     print("\nALL DAILY-BACKUP TESTS PASSED")
 
 
+def run_settings(tmp: Path):
+    """Persisted schedule settings: defaults from config, overrides survive, and
+    values are validated."""
+    from costco_archiver import config
+    config.DATA_DIR = tmp
+    config.BACKUP_DAILY, config.BACKUP_INTERVAL_HOURS, config.BACKUP_KEEP = True, 24.0, 14
+
+    assert bk.get_settings() == {"daily": True, "interval_hours": 24.0, "keep": 14}
+    # Partial update persists and merges with unchanged fields.
+    bk.update_settings(keep=5)
+    assert bk.get_settings()["keep"] == 5 and bk.get_settings()["daily"] is True
+    bk.update_settings(daily=False, interval_hours=12)
+    got = bk.get_settings()
+    assert (got["daily"], got["interval_hours"], got["keep"]) == (False, 12.0, 5), got
+    # Bounds are enforced.
+    for field, val in (("interval_hours", 0), ("interval_hours", 1000),
+                       ("keep", -1), ("keep", 5000)):
+        try:
+            bk.update_settings(**{field: val})
+            assert False, f"accepted out-of-range {field}={val}"
+        except ValueError:
+            pass
+    print("settings OK: defaults from config, partial updates persist, bounds enforced")
+    print("\nALL SETTINGS TESTS PASSED")
+
+
 if __name__ == "__main__":
-    for fn in (run, run_daily):
+    for fn in (run, run_daily, run_settings):
         d = Path(tempfile.mkdtemp())
         try:
             fn(d)

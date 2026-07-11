@@ -524,9 +524,7 @@ class _Handler(BaseHTTPRequestHandler):
             from . import backup
             self._send(200, json.dumps({
                 "backups": backup.list_backups(),
-                "schedule": {"daily": config.BACKUP_DAILY,
-                             "interval_hours": config.BACKUP_INTERVAL_HOURS,
-                             "keep": config.BACKUP_KEEP},
+                "schedule": backup.get_settings(),
             }).encode())
         elif path.startswith("/backup/"):
             # Admin-only: download a backup archive.
@@ -732,6 +730,18 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/backups/delete":
                 backup.delete_backup(str(body.get("name", "")).strip())
                 self._send(200, json.dumps({"ok": True}).encode())
+            elif path == "/api/backups/settings":
+                s = backup.update_settings(
+                    daily=body.get("daily"),
+                    interval_hours=body.get("interval_hours"),
+                    keep=body.get("keep"))
+                self._send(200, json.dumps({"ok": True, "schedule": s}).encode())
+            elif path == "/api/backups/prune":
+                keep = body.get("keep")
+                keep = int(keep) if keep is not None else backup.get_settings()["keep"]
+                removed = backup.prune_backups(keep)
+                self._send(200, json.dumps(
+                    {"ok": True, "removed": removed, "keep": keep}).encode())
             else:
                 self._send(404, b'{"error":"not found"}')
         except ValueError as ex:
@@ -743,31 +753,41 @@ class _Handler(BaseHTTPRequestHandler):
 def _start_backup_scheduler() -> None:
     """Background thread that snapshots the imported data on an interval (default
     daily) and prunes old automatic backups. A tick is a no-op when the raw data
-    hasn't changed since the last backup. Controlled by COSTCO_BACKUP_* env."""
-    if not config.BACKUP_DAILY:
-        return
-    interval = max(0.1, config.BACKUP_INTERVAL_HOURS) * 3600.0
+    hasn't changed since the last backup.
+
+    Settings (enabled/interval/keep) are read fresh each poll from
+    backup.get_settings(), so changes made in the UI take effect within ~a minute
+    without a restart. The env COSTCO_BACKUP_* values seed the defaults.
+    """
+    from . import backup
 
     def _loop():
         time.sleep(15)  # let startup settle before the first check
+        last_run = 0.0
         while True:
             try:
-                from . import backup
-                res = backup.daily_backup_tick(keep=config.BACKUP_KEEP)
-                if res.get("created"):
-                    c = res["created"]
-                    print(f"[backup] daily snapshot {c['name']} "
-                          f"({c['receipt_count']} receipts, {c['size'] // 1024} KB)")
-                if res.get("pruned"):
-                    print(f"[backup] pruned {len(res['pruned'])} old backup(s)")
+                s = backup.get_settings()
+                interval = max(0.1, s["interval_hours"]) * 3600.0
+                if s["daily"] and (time.time() - last_run) >= interval:
+                    res = backup.daily_backup_tick(keep=s["keep"])
+                    last_run = time.time()
+                    if res.get("created"):
+                        c = res["created"]
+                        print(f"[backup] scheduled snapshot {c['name']} "
+                              f"({c['receipt_count']} receipts, {c['size'] // 1024} KB)")
+                    if res.get("pruned"):
+                        print(f"[backup] pruned {len(res['pruned'])} old backup(s)")
             except Exception as ex:
                 print(f"[backup] scheduler error: {ex}")
-            time.sleep(interval)
+            time.sleep(60)  # cheap poll; the tick itself runs at most once/interval
 
     threading.Thread(target=_loop, daemon=True).start()
-    every = config.BACKUP_INTERVAL_HOURS
-    print(f"Automatic backups: every {every:g}h, keeping newest "
-          f"{config.BACKUP_KEEP} (COSTCO_BACKUP_DAILY=0 to disable).")
+    s = backup.get_settings()
+    if s["daily"]:
+        print(f"Automatic backups: every {s['interval_hours']:g}h, keeping newest "
+              f"{s['keep']} (manageable in the Backups tab).")
+    else:
+        print("Automatic backups: disabled (enable in the Backups tab).")
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -1165,13 +1185,28 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         collection/import that brings in new receipts, plus on a schedule.
         <b>Restore never creates duplicates</b>: receipts already on disk are skipped,
         and the CSVs/Markdown/PDFs rebuild afterward.</p>
-      <div id="bk_schedule" class="sched"></div>
-      <div class="inline" style="margin-top:10px">
+      <div class="inline" style="margin-top:4px">
         <input id="bk_label" placeholder="optional label" style="padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg);font-size:13px">
         <button class="btn" id="backupBtn" onclick="createBackup()">Create backup now</button>
         <button class="btn secondary" id="backupReloadBtn" onclick="loadBackups()">↻ Refresh list</button>
         <span class="msg" id="backupMsg"></span>
       </div>
+    </div>
+    <div class="card">
+      <h2>Schedule &amp; retention</h2>
+      <div class="inline" style="gap:18px;flex-wrap:wrap">
+        <label class="toggle"><input type="checkbox" id="bk_daily"> Automatic backups</label>
+        <label>Every
+          <input id="bk_interval" type="number" min="1" max="720" step="1" style="width:64px;padding:5px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg)"> hours
+        </label>
+        <label>Keep newest
+          <input id="bk_keep" type="number" min="0" max="1000" step="1" style="width:64px;padding:5px;border:1px solid var(--bd);border-radius:6px;background:var(--input-bg);color:var(--fg)"> automatic
+        </label>
+        <button class="btn" id="bkSettingsBtn" onclick="saveBackupSettings()">Save</button>
+        <button class="btn secondary" onclick="pruneBackups()" title="Delete old automatic backups now, keeping the newest N">Prune now</button>
+        <span class="msg" id="bkSettingsMsg"></span>
+      </div>
+      <div id="bk_schedule" class="sched" style="margin-top:10px"></div>
     </div>
     <div class="card">
       <h2>Available backups</h2>
@@ -1784,11 +1819,16 @@ async function loadBackups(){
   let d;
   try{ d = await (await api("/api/backups")).json(); }catch(e){ return; }
   const s = d.schedule || {};
+  // Populate the editable settings (don't clobber a field the user is editing).
+  const ae = document.activeElement;
+  if($("bk_daily") && ae!==$("bk_daily")) $("bk_daily").checked = !!s.daily;
+  if($("bk_interval") && ae!==$("bk_interval")) $("bk_interval").value = (+s.interval_hours||24);
+  if($("bk_keep") && ae!==$("bk_keep")) $("bk_keep").value = (s.keep==null?14:s.keep);
   const sch = $("bk_schedule");
   if(sch){
     sch.innerHTML = s.daily
-      ? `Automatic backups: <b>every ${(+s.interval_hours||24)}h</b>, keeping the newest <b>${s.keep}</b> (manual backups are never pruned).`
-      : `Automatic backups are <b>disabled</b> (set <code>COSTCO_BACKUP_DAILY=1</code> to enable).`;
+      ? `Automatic backups: <b>every ${(+s.interval_hours||24)}h</b>, keeping the newest <b>${s.keep}</b> automatic backups (manual backups are never pruned).`
+      : `Automatic backups are <b>disabled</b>.`;
   }
   const rows = d.backups || [];
   tb.innerHTML = rows.map(b => {
@@ -1846,6 +1886,33 @@ async function deleteBackup(enc){
     const d = await r.json();
     if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; return; }
     msg.className="msg ok"; msg.textContent="Deleted."; loadBackups();
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
+}
+async function saveBackupSettings(){
+  const msg = $("bkSettingsMsg"); msg.className="msg"; msg.textContent="Saving…";
+  $("bkSettingsBtn").disabled = true;
+  const body = { daily: $("bk_daily").checked,
+                 interval_hours: Number($("bk_interval").value)||24,
+                 keep: Math.max(0, parseInt($("bk_keep").value, 10) || 0) };
+  try{
+    const r = await api("/api/backups/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; }
+    else { msg.className="msg ok"; msg.textContent = "Saved."; loadBackups(); }
+  }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
+  $("bkSettingsBtn").disabled = false;
+}
+async function pruneBackups(){
+  const keep = Math.max(0, parseInt($("bk_keep").value, 10) || 0);
+  if(!confirm(`Prune now? Keeps the newest ${keep} automatic backups; manual backups are never removed.`)) return;
+  const msg = $("bkSettingsMsg"); msg.className="msg"; msg.textContent="Pruning…";
+  try{
+    const r = await api("/api/backups/prune",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({keep})});
+    const d = await r.json();
+    if(!r.ok || !d.ok){ msg.className="msg err"; msg.textContent = d.error || "Failed"; return; }
+    msg.className="msg ok"; msg.textContent = `Removed ${(d.removed||[]).length} old backup(s).`; loadBackups();
   }catch(e){ msg.className="msg err"; msg.textContent = String(e); }
 }
 // If a collection is already running when the page loads, resume showing status.
