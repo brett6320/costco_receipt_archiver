@@ -38,7 +38,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=linux-amd64
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: local/${{ github.event.repository.name }}:scan
           format: sarif
