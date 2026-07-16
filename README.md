@@ -3,6 +3,8 @@
 [![build-image](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/build-image.yml/badge.svg)](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/build-image.yml)
 [![tests](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/tests.yml/badge.svg)](https://github.com/brett6320/costco_receipt_archiver/actions/workflows/tests.yml)
 
+The container image is scanned for CRITICAL/HIGH vulnerabilities with [Trivy](https://github.com/aquasecurity/trivy) before every build.
+
 Logs into Costco.com in a real browser you control, downloads **all available
 warehouse & gas receipts**, and compiles every purchased item into
 **deduplicated CSVs** — by date, price, and item number.
